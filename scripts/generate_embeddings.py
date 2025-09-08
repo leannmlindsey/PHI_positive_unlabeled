@@ -56,65 +56,69 @@ class ESM2Embedder:
         torch_version = torch.__version__
         self.logger.info(f"PyTorch version: {torch_version}")
         
-        try:
-            # Load model checkpoint - use weights_only=False for compatibility
-            checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
-            
-            # Import ESM after confirming we can load the checkpoint
-            import esm
-            
-            # Get model info from checkpoint
-            if 'cfg' in checkpoint:
-                # This is a fairseq checkpoint
-                model_name = checkpoint['cfg']['model'].get('_name', 'esm2_t33_650M_UR50D')
-            else:
-                # Default to t33_650M model
-                model_name = 'esm2_t33_650M_UR50D'
-            
-            self.logger.info(f"Model architecture: {model_name}")
-            
-            # Load model and alphabet based on architecture
-            if 't33_650M' in model_name or 't33' in self.model_path.lower():
-                self.model, self.alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-                expected_layers = 33
-            elif 't30_150M' in model_name or 't30' in self.model_path.lower():
-                self.model, self.alphabet = esm.pretrained.esm2_t30_150M_UR50D()
-                expected_layers = 30
-            elif 't36_3B' in model_name or 't36' in self.model_path.lower():
-                self.model, self.alphabet = esm.pretrained.esm2_t36_3B_UR50D()
-                expected_layers = 36
-            elif 't48_15B' in model_name or 't48' in self.model_path.lower():
-                self.model, self.alphabet = esm.pretrained.esm2_t48_15B_UR50D()
-                expected_layers = 48
-            else:
-                # Default to t33
-                self.logger.warning(f"Unknown model architecture, defaulting to t33_650M")
-                self.model, self.alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-                expected_layers = 33
-            
-            # Load weights from checkpoint
-            if 'model' in checkpoint:
-                model_state = checkpoint['model']
-            elif 'state_dict' in checkpoint:
-                model_state = checkpoint['state_dict']
-            else:
-                model_state = checkpoint
-            
-            # Filter out unexpected keys
-            model_keys = set(self.model.state_dict().keys())
-            filtered_state = {k: v for k, v in model_state.items() if k in model_keys}
-            
-            # Load the filtered state
-            self.model.load_state_dict(filtered_state, strict=False)
-            
-            self.logger.info(f"Loaded {len(filtered_state)}/{len(model_state)} parameters")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to load model from checkpoint: {e}")
-            self.logger.info("Falling back to downloading pre-trained model")
-            
-            import esm
+        # Import ESM
+        import esm
+        
+        # Determine model architecture from path
+        model_path_lower = self.model_path.lower()
+        if 't33' in model_path_lower or '650m' in model_path_lower:
+            self.logger.info("Loading ESM-2 t33_650M model")
             self.model, self.alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+            expected_layers = 33
+        elif 't30' in model_path_lower or '150m' in model_path_lower:
+            self.logger.info("Loading ESM-2 t30_150M model")
+            self.model, self.alphabet = esm.pretrained.esm2_t30_150M_UR50D()
+            expected_layers = 30
+        elif 't36' in model_path_lower or '3b' in model_path_lower:
+            self.logger.info("Loading ESM-2 t36_3B model")
+            self.model, self.alphabet = esm.pretrained.esm2_t36_3B_UR50D()
+            expected_layers = 36
+        elif 't48' in model_path_lower or '15b' in model_path_lower:
+            self.logger.info("Loading ESM-2 t48_15B model")
+            self.model, self.alphabet = esm.pretrained.esm2_t48_15B_UR50D()
+            expected_layers = 48
+        else:
+            # Default to t33
+            self.logger.info("Could not determine model type from path, defaulting to t33_650M")
+            self.model, self.alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+            expected_layers = 33
+        
+        # Now load the checkpoint weights if the file exists
+        if os.path.exists(self.model_path):
+            try:
+                self.logger.info(f"Loading weights from checkpoint: {self.model_path}")
+                
+                # Load checkpoint
+                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
+                
+                # Extract state dict
+                if 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                elif 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                else:
+                    state_dict = checkpoint
+                
+                # Clean up state dict keys if needed
+                new_state_dict = {}
+                for key, value in state_dict.items():
+                    # Remove 'module.' prefix if present (from DataParallel)
+                    if key.startswith('module.'):
+                        new_key = key[7:]
+                    else:
+                        new_key = key
+                    new_state_dict[new_key] = value
+                
+                # Load the weights
+                self.model.load_state_dict(new_state_dict, strict=False)
+                self.logger.info("Successfully loaded checkpoint weights")
+                
+            except Exception as e:
+                self.logger.warning(f"Could not load checkpoint weights: {e}")
+                self.logger.info("Using downloaded pre-trained weights instead")
+        else:
+            self.logger.warning(f"Checkpoint file not found at {self.model_path}")
+            self.logger.info("Using downloaded pre-trained weights")
         
         # Set up batch converter
         self.batch_converter = self.alphabet.get_batch_converter()
@@ -123,9 +127,12 @@ class ESM2Embedder:
         self.model = self.model.to(self.device)
         self.model.eval()
         
-        # Get embedding dimension
+        # Get embedding dimension and layer count
         self.embedding_dim = self.model.args.embed_dim if hasattr(self.model, 'args') else 1280
-        self.logger.info(f"Model loaded successfully. Embedding dimension: {self.embedding_dim}")
+        self.repr_layers = [expected_layers]  # Use the last layer
+        
+        self.logger.info(f"Model ready. Embedding dimension: {self.embedding_dim}, "
+                        f"Using layer: {expected_layers}")
         
     def generate_embeddings(self, sequences: Dict[str, str]) -> Dict[str, np.ndarray]:
         """
@@ -161,8 +168,8 @@ class ESM2Embedder:
                     batch_tokens = batch_tokens.to(self.device)
                     
                     # Get embeddings
-                    results = self.model(batch_tokens, repr_layers=[33], return_contacts=False)
-                    batch_embeddings = results["representations"][33]
+                    results = self.model(batch_tokens, repr_layers=self.repr_layers, return_contacts=False)
+                    batch_embeddings = results["representations"][self.repr_layers[0]]
                     
                     # Extract per-sequence embeddings (mean over length)
                     for i, hash_id in enumerate(batch_hashes):
