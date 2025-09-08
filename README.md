@@ -166,8 +166,8 @@ The script will:
 - Support PyTorch 2.6+ compatibility
 
 Output files:
-- `data/embeddings/host_embeddings.h5` - Host protein embeddings
-- `data/embeddings/phage_embeddings.h5` - Phage protein embeddings
+- `data/embeddings/host_embeddings.h5` - Host protein embeddings ([HDF5 format](#hdf5-file-format))
+- `data/embeddings/phage_embeddings.h5` - Phage protein embeddings ([HDF5 format](#hdf5-file-format))
 
 ### 3. Monitoring Progress
 
@@ -210,6 +210,57 @@ See `requirements.txt` for full list. Key packages:
 - H5py (efficient embedding storage)
 - Pandas & NumPy (data processing)
 - Scikit-learn (metrics)
+
+## HDF5 File Format
+
+The embedding files use HDF5 (Hierarchical Data Format version 5), a binary format designed for efficient storage of large scientific datasets. Think of it as a filesystem inside a single file.
+
+### Structure of Embedding Files
+
+Each embedding file contains:
+```
+host_embeddings.h5
+├── embeddings (dataset)     # Shape: (n_proteins, 1280) float32
+└── hashes (dataset)         # Shape: (n_proteins,) strings (MD5 hashes)
+```
+
+### Key Benefits
+
+- **Efficient Storage**: Data is compressed, reducing ~30GB to manageable size
+- **Fast Access**: Can read specific batches without loading entire file
+- **Memory-Friendly**: Works with datasets larger than RAM via memory mapping
+- **Resumable**: Can append new embeddings without rewriting file
+
+### Accessing HDF5 Files
+
+```python
+import h5py
+import numpy as np
+
+# Read embeddings
+with h5py.File('data/embeddings/host_embeddings.h5', 'r') as f:
+    # See contents
+    print(f.keys())  # ['embeddings', 'hashes']
+    
+    # Get info
+    print(f['embeddings'].shape)  # (2907, 1280)
+    
+    # Load all data
+    all_embeddings = f['embeddings'][:]
+    all_hashes = f['hashes'][:].astype(str)
+    
+    # Load specific items
+    first_10 = f['embeddings'][:10]
+    
+    # Find embedding for specific protein
+    target_hash = "abc123..."
+    idx = np.where(f['hashes'][:].astype(str) == target_hash)[0][0]
+    embedding = f['embeddings'][idx]
+```
+
+### Chunking Strategy
+
+The files use `chunks=(100, 1280)` meaning data is stored in 100-row blocks, optimized for batch loading during training where typical batch sizes are 8-32 samples.
 
 ## Citation
 
