@@ -339,8 +339,8 @@ class MILModel(nn.Module):
         # Scale by sqrt(d) for stability
         scores = scores / math.sqrt(self.embedding_dim)
         
-        # Apply temperature scaling
-        scores = scores * self.temperature
+        # Apply temperature scaling (divide to reduce scores)
+        scores = scores / self.temperature
         
         # Create combined mask with proper shape checking
         if marker_mask is not None and rbp_mask is not None:
