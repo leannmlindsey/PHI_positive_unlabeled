@@ -102,7 +102,43 @@ class ESM2Embedder:
         Returns:
             Array of embeddings
         """
-        # Convert sequences for batch processing
+        # Check if batch would be too large
+        max_seq_len = max(len(seq) for _, seq in sequences)
+        estimated_memory_gb = (len(sequences) * max_seq_len * max_seq_len * 4) / (1024**3)
+        
+        # If estimated memory > 40GB, process sequences individually
+        if estimated_memory_gb > 40:
+            self.logger.warning(f"Batch too large ({estimated_memory_gb:.1f}GB), processing individually")
+            embeddings = []
+            for label, seq in sequences:
+                try:
+                    # Process single sequence
+                    single_batch = [(label, seq)]
+                    batch_labels, batch_strs, batch_tokens = self.batch_converter(single_batch)
+                    batch_tokens = batch_tokens.to(self.device)
+                    
+                    with torch.no_grad():
+                        results = self.model(batch_tokens, repr_layers=[33], return_contacts=False)
+                        token_embeddings = results["representations"][33]
+                    
+                    # Extract embedding
+                    seq_len = len(seq)
+                    seq_embeddings = token_embeddings[0, 1:seq_len+1]
+                    pooled = seq_embeddings.mean(dim=0)
+                    embeddings.append(pooled.cpu().numpy())
+                    
+                    # Clear cache after each sequence
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+                except Exception as e:
+                    self.logger.error(f"Failed to process sequence of length {len(seq)}: {e}")
+                    # Return zero embedding for failed sequences
+                    embeddings.append(np.zeros(self.embed_dim))
+                    
+            return np.array(embeddings)
+        
+        # Normal batch processing for smaller batches
         batch_labels, batch_strs, batch_tokens = self.batch_converter(sequences)
         batch_tokens = batch_tokens.to(self.device)
         
