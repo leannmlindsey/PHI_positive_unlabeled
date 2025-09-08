@@ -70,7 +70,7 @@ training:
   scheduler_params:
     # For warmup_cosine (RECOMMENDED for PU learning)
     warmup_epochs: 5  # Number of epochs for linear warmup
-    warmup_steps: null  # Or specify exact steps (overrides warmup_epochs)
+    warmup_steps: 1000  # Or specify exact steps (overrides warmup_epochs)
     
     # For onecycle
     pct_start: 0.3  # Percentage of training for increasing LR
