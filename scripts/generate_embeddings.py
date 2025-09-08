@@ -151,6 +151,7 @@ class ESM2EmbeddingGenerator:
     
     def __init__(self, 
                  model_name: str = "facebook/esm2_t33_650M_UR50D",
+                 model_path: str = None,
                  batch_size: int = 8,
                  max_length: int = 1024,
                  device: str = None,
@@ -160,12 +161,14 @@ class ESM2EmbeddingGenerator:
         
         Args:
             model_name: ESM-2 model name from HuggingFace
+            model_path: Local path to pre-downloaded model (optional)
             batch_size: Batch size for processing
             max_length: Maximum sequence length
             device: Device to use (cuda/cpu)
             logger: Logger instance
         """
         self.model_name = model_name
+        self.model_path = model_path
         self.batch_size = batch_size
         self.max_length = max_length
         self.logger = logger or logging.getLogger(__name__)
@@ -184,10 +187,15 @@ class ESM2EmbeddingGenerator:
         
     def load_model(self) -> None:
         """Load the ESM-2 model and tokenizer"""
-        self.logger.info(f"Loading ESM-2 model: {self.model_name}")
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = EsmModel.from_pretrained(self.model_name)
+        # Use local path if provided, otherwise download from HuggingFace
+        if self.model_path and Path(self.model_path).exists():
+            self.logger.info(f"Loading ESM-2 model from local path: {self.model_path}")
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, local_files_only=True)
+            self.model = EsmModel.from_pretrained(self.model_path, local_files_only=True)
+        else:
+            self.logger.info(f"Loading ESM-2 model from HuggingFace: {self.model_name}")
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self.model = EsmModel.from_pretrained(self.model_name)
         
         self.model = self.model.to(self.device)
         self.model.eval()
@@ -394,6 +402,8 @@ def main():
                        help="Output directory for embeddings")
     parser.add_argument("--model_name", type=str, default="facebook/esm2_t33_650M_UR50D",
                        help="ESM-2 model name")
+    parser.add_argument("--model_path", type=str, default=None,
+                       help="Local path to pre-downloaded ESM-2 model (optional)")
     parser.add_argument("--batch_size", type=int, default=8,
                        help="Batch size for processing")
     parser.add_argument("--max_length", type=int, default=1024,
@@ -426,6 +436,7 @@ def main():
     # Generate embeddings
     generator = ESM2EmbeddingGenerator(
         model_name=args.model_name,
+        model_path=args.model_path,
         batch_size=args.batch_size,
         max_length=args.max_length,
         device=args.device,

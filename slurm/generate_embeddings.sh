@@ -27,11 +27,18 @@ mkdir -p logs
 mkdir -p checkpoints
 mkdir -p data/processed
 
+# Set the local model path (update this to your actual path)
+# You can pass this as an environment variable or command line argument
+ESM2_MODEL_PATH="${ESM2_MODEL_PATH:-/data/$USER/models/esm2_t33_650M_UR50D}"
+
+echo "Using ESM-2 model from: $ESM2_MODEL_PATH"
+
 # Run the embedding generation script
 python scripts/generate_embeddings.py \
     --data_path data/dedup.phage_marker_rbp_with_phage_entropy.tsv \
     --output_dir data/processed \
     --model_name facebook/esm2_t33_650M_UR50D \
+    --model_path "$ESM2_MODEL_PATH" \
     --batch_size 16 \
     --max_length 1024 \
     --device cuda \

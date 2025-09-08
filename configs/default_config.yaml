@@ -1,0 +1,189 @@
+# Default configuration for Phage-Host Interaction Prediction Model
+
+# Data paths
+data:
+  data_path: "data/dedup.phage_marker_rbp_with_phage_entropy.tsv"
+  splits_path: "data/processed/splits.pkl"
+  embeddings_path: "data/processed/protein_embeddings.h5"
+  output_dir: "outputs"
+  checkpoint_dir: "checkpoints"
+
+# Model architecture
+model:
+  # Embedding dimension from ESM-2
+  input_dim: 1280
+  
+  # Encoder architecture options
+  encoder_type: "balanced"  # Options: "conservative", "balanced", "aggressive"
+  
+  # Balanced encoder dimensions (1280 -> 768 -> 512 -> 256)
+  encoder_dims_balanced: [768, 512, 256]
+  
+  # Conservative encoder dimensions (1280 -> 1024 -> 512)
+  encoder_dims_conservative: [1024, 512]
+  
+  # Aggressive encoder dimensions (1280 -> 512 -> 256 -> 128)
+  encoder_dims_aggressive: [512, 256, 128]
+  
+  # Final embedding dimension (last layer of encoder)
+  embedding_dim: 256  # Will be overridden based on encoder_type
+  
+  # Dropout rate
+  dropout: 0.1
+  
+  # Temperature for sigmoid in pairwise scoring
+  temperature: 1.0
+  
+  # Use layer normalization
+  use_layer_norm: true
+  
+  # Activation function
+  activation: "relu"  # Options: "relu", "gelu", "tanh"
+
+# Training parameters
+training:
+  # Batch size
+  batch_size: 32
+  
+  # Learning rate
+  learning_rate: 1.0e-4
+  
+  # Number of epochs
+  num_epochs: 100
+  
+  # Optimizer
+  optimizer: "adamw"  # Options: "adam", "adamw", "sgd"
+  
+  # Weight decay (L2 regularization)
+  weight_decay: 1.0e-5
+  
+  # Gradient clipping
+  gradient_clip: 1.0
+  
+  # Learning rate scheduler
+  scheduler: "cosine"  # Options: "cosine", "step", "plateau", "none"
+  
+  # Scheduler parameters
+  scheduler_params:
+    # For step scheduler
+    step_size: 30
+    gamma: 0.1
+    # For plateau scheduler
+    patience: 10
+    factor: 0.5
+    # For cosine scheduler
+    T_max: 100
+    eta_min: 1.0e-6
+  
+  # Early stopping
+  early_stopping: true
+  early_stopping_patience: 20
+  early_stopping_min_delta: 1.0e-4
+  
+  # Checkpoint saving
+  save_every_n_epochs: 5
+  save_best_only: true
+  
+  # Validation frequency
+  validate_every_n_epochs: 1
+
+# nnPU Loss parameters
+loss:
+  # Class prior (estimated proportion of positive samples in unlabeled data)
+  class_prior: 0.3
+  
+  # Beta for nnPU loss (controls negative risk correction)
+  beta: 0.0
+  
+  # Gamma for nnPU loss (controls gradient penalty)
+  gamma: 1.0
+  
+  # Use hard bootstrapping
+  hard_bootstrap: false
+
+# Data parameters
+dataset:
+  # Negative sampling ratio (negative:positive)
+  negative_ratio: 1.0
+  
+  # Random seed for negative sampling
+  negative_sampling_seed: 42
+  
+  # Maximum number of proteins per bag (for padding)
+  max_markers: 2
+  max_rbps: 20
+  
+  # Data loader workers
+  num_workers: 4
+  
+  # Pin memory for faster GPU transfer
+  pin_memory: true
+
+# Evaluation parameters
+evaluation:
+  # Metrics to compute
+  metrics:
+    - "accuracy"
+    - "mcc"
+    - "f1"
+    - "precision"
+    - "recall"
+    - "auroc"
+    - "auprc"
+  
+  # Compute Hit@K and Recall@K for these values
+  k_values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  
+  # Threshold for binary classification
+  classification_threshold: 0.5
+  
+  # Save predictions
+  save_predictions: true
+  
+  # Generate confusion matrix
+  generate_confusion_matrix: true
+
+# Logging parameters
+logging:
+  # Use wandb for experiment tracking
+  use_wandb: true
+  
+  # Wandb project name
+  wandb_project: "phage-host-pu-learning"
+  
+  # Wandb entity (username or team)
+  wandb_entity: null  # Set to your wandb username
+  
+  # Log frequency (batches)
+  log_every_n_batches: 10
+  
+  # Log directory
+  log_dir: "logs"
+  
+  # Verbosity level
+  verbosity: "info"  # Options: "debug", "info", "warning", "error"
+
+# Random seeds for reproducibility
+seeds:
+  # General random seed
+  random_seed: 42
+  
+  # PyTorch seed
+  torch_seed: 42
+  
+  # NumPy seed
+  numpy_seed: 42
+
+# Device settings
+device:
+  # Device to use
+  device: "cuda"  # Options: "cuda", "cpu", "mps"
+  
+  # CUDA device ID (if multiple GPUs)
+  cuda_device_id: 0
+  
+  # Mixed precision training
+  use_mixed_precision: false
+  
+  # Distributed training
+  distributed: false

@@ -25,16 +25,31 @@ phi_pos_unlabeled/
 │   ├── dedup.phage_marker_rbp_with_phage_entropy.tsv  # Original interaction data
 │   └── processed/                 # Generated splits and embeddings
 ├── scripts/                       # Executable scripts
-│   ├── simple_splitting.py        # Data splitting with RBP deduplication
-│   └── generate_embeddings.py    # ESM-2 embedding generation
+│   ├── simple_splitting.py        # Data splitting with RBP deduplication  ✅
+│   ├── graph_based_splitting.py  # Alternative graph-based splitting  ✅
+│   └── generate_embeddings.py    # ESM-2 embedding generation  ✅
 ├── slurm/                         # HPC job submission scripts
-├── models/                        # Model architecture (to be implemented)
-├── training/                      # Training pipeline (to be implemented)
+│   └── generate_embeddings.sh    # SLURM script for Biowulf  ✅
+├── models/                        # Model architecture
+│   ├── __init__.py               # Module initialization  ✅
+│   ├── encoders.py               # Two-tower encoder architecture  ✅
+│   ├── mil_model.py             # MIL model with noisy-OR  ✅
+│   └── losses.py                 # nnPU loss implementation  ✅
+├── training/                      # Training pipeline
+│   ├── __init__.py               # Module initialization  ✅
+│   └── dataset.py                # PyTorch dataset classes  ✅
 ├── utils/                         # Utility functions
-│   └── data_utils.py             # Data processing utilities
+│   ├── __init__.py               # Module initialization  ✅
+│   ├── data_utils.py             # Data processing utilities  ✅
+│   └── logging_utils.py          # Logging and metrics tracking  ✅
 ├── configs/                       # Configuration files
+│   └── default_config.yaml       # Default training configuration  ✅
 ├── logs/                          # Execution logs
-└── checkpoints/                   # Model and process checkpoints
+├── checkpoints/                   # Model and process checkpoints
+├── requirements.txt               # Python dependencies  ✅
+├── README.md                      # Project documentation  ✅
+├── IMPLEMENTATION_PLAN_FINAL.md  # Detailed implementation plan  ✅
+└── CLAUDE.md                      # Development guidelines  ✅
 ```
 
 ## Input Data Description
@@ -142,11 +157,15 @@ squeue -u $USER
 
 The model uses a two-tower architecture with noisy-OR aggregation:
 
-1. **Input**: Multi-instance bags of protein embeddings
+1. **Input**: Multi-instance bags of protein embeddings (1280-dim from ESM-2)
 2. **Two-Tower Encoders**: Separate networks for host and phage proteins
-3. **Pairwise Scoring**: Dot product between all protein pairs
+   - Configurable depth: Conservative (1280→1024→512), Balanced (1280→768→512→256), or Aggressive (1280→512→256→128)
+   - Layer normalization and dropout for regularization
+3. **Pairwise Scoring**: Scaled dot product between all protein pairs with temperature scaling
 4. **Noisy-OR Aggregation**: Combine pairwise scores into bag-level prediction
+   - Models the probability that at least one protein pair interacts
 5. **nnPU Loss**: Non-negative risk estimation for positive-unlabeled learning
+   - Handles class prior estimation and risk correction
 
 ## Key Features
 

@@ -12,7 +12,6 @@ fair-esm
 
 # Data processing
 biopython
-networkx
 
 # Visualization and monitoring
 matplotlib
@@ -20,10 +19,9 @@ seaborn
 tqdm
 
 # Logging and utilities
-tensorboard
 wandb
 
-# Development tools
-pytest
-black
-pylint
+# Development tools (optional)
+# pytest  # For unit testing
+# black   # For code formatting  
+# pylint  # For code linting
