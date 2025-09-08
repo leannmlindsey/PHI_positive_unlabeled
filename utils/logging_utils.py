@@ -8,6 +8,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
 import json
+import numpy as np
 
 
 def setup_logger(
@@ -122,8 +123,22 @@ class MetricLogger:
         
     def save(self):
         """Save metrics to JSON file"""
+        # Convert numpy types to Python types for JSON serialization
+        def convert_numpy(obj):
+            if isinstance(obj, (np.integer, np.int64, np.int32)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {k: convert_numpy(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy(item) for item in obj]
+            return obj
+        
         with open(self.metrics_file, 'w') as f:
-            json.dump(self.metrics, f, indent=2)
+            json.dump(convert_numpy(self.metrics), f, indent=2)
             
     def load(self):
         """Load metrics from JSON file"""
