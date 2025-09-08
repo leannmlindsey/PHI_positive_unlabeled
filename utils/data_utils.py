@@ -369,19 +369,22 @@ class DataProcessor:
         for idx, row in df.iterrows():
             # Parse host hashes
             host_hashes = []
-            if pd.notna(row['host_md5_set']) and row['host_md5_set']:
-                host_hashes = [h.strip() for h in str(row['host_md5_set']).split(',') 
-                             if h.strip() and h.strip() != 'nan']
+            host_field = str(row['host_md5_set']).strip()
+            if pd.notna(row['host_md5_set']) and host_field and host_field != 'nan' and host_field != '':
+                host_hashes = [h.strip() for h in host_field.split(',') 
+                             if h.strip() and h.strip() != 'nan' and h.strip() != '']
             
             # Parse phage hashes
             phage_hashes = []
-            if pd.notna(row['phage_md5_set']) and row['phage_md5_set']:
-                phage_hashes = [h.strip() for h in str(row['phage_md5_set']).split(',')
-                              if h.strip() and h.strip() != 'nan']
+            phage_field = str(row['phage_md5_set']).strip()
+            if pd.notna(row['phage_md5_set']) and phage_field and phage_field != 'nan' and phage_field != '':
+                phage_hashes = [h.strip() for h in phage_field.split(',')
+                              if h.strip() and h.strip() != 'nan' and h.strip() != '']
             
             # Skip if empty
             if not host_hashes or not phage_hashes:
-                self.logger.warning(f"Skipping row {idx}: empty host or phage hashes")
+                self.logger.warning(f"Skipping row {idx}: empty host or phage hashes (host={len(host_hashes)}, phage={len(phage_hashes)})")
+                self.logger.debug(f"  Raw host field: '{row.get('host_md5_set', '')}', Raw phage field: '{row.get('phage_md5_set', '')}' ")
                 continue
             
             # Create positive bag
@@ -429,16 +432,18 @@ class DataProcessor:
         
         for idx, row in df.iterrows():
             # Host hashes
-            if pd.notna(row['host_md5_set']) and row['host_md5_set']:
-                host_hashes = [h.strip() for h in str(row['host_md5_set']).split(',')
-                             if h.strip() and h.strip() != 'nan']
+            host_field = str(row['host_md5_set']).strip()
+            if pd.notna(row['host_md5_set']) and host_field and host_field != 'nan' and host_field != '':
+                host_hashes = [h.strip() for h in host_field.split(',')
+                             if h.strip() and h.strip() != 'nan' and h.strip() != '']
                 if host_hashes:
                     all_host_sets.append(host_hashes)
             
             # Phage hashes
-            if pd.notna(row['phage_md5_set']) and row['phage_md5_set']:
-                phage_hashes = [h.strip() for h in str(row['phage_md5_set']).split(',')
-                              if h.strip() and h.strip() != 'nan']
+            phage_field = str(row['phage_md5_set']).strip()
+            if pd.notna(row['phage_md5_set']) and phage_field and phage_field != 'nan' and phage_field != '':
+                phage_hashes = [h.strip() for h in phage_field.split(',')
+                              if h.strip() and h.strip() != 'nan' and h.strip() != '']
                 if phage_hashes:
                     all_phage_sets.append(phage_hashes)
         
