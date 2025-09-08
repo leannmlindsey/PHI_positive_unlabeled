@@ -264,8 +264,8 @@ class PhageHostDataModule:
             seed=self.seed
         )
         
-        # Generate negative samples for validation (use val_negative_ratio if specified)
-        val_neg_ratio = 4.0  # 4:1 negative:positive for 20% positive rate
+        # Generate negative samples for validation - keep balanced for proper learning signal
+        val_neg_ratio = 1.0  # 1:1 for balanced validation (50% positive rate)
         val_negative = self.data_processor.generate_negative_samples(
             val_positive,
             negative_ratio=val_neg_ratio,
