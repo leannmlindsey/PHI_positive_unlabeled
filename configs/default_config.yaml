@@ -116,8 +116,9 @@ training:
 
 # nnPU Loss parameters
 loss:
-  # Class prior (estimated proportion of positive samples in unlabeled data)
-  class_prior: 0.5
+  # Class prior (estimated proportion of positive samples contaminating the unlabeled/negative data)
+  # In real world, ~2-5% of "negative" samples might actually be positive
+  class_prior: 0.03
   
   # Beta for nnPU loss (controls negative risk correction)
   beta: 0.0
@@ -131,7 +132,16 @@ loss:
 # Data parameters
 dataset:
   # Negative sampling ratio (negative:positive)
+  # For training: keep balanced for better learning
   negative_ratio: 1.0
+  
+  # Validation negative ratio (to simulate real-world distribution)
+  # 0.2 means 20% positive, 80% negative (closer to reality)
+  val_negative_ratio: 4.0
+  
+  # Test negative ratio (to match real-world ~2% positive rate)
+  # 49 negatives per positive = ~2% positive rate
+  test_negative_ratio: 49.0
   
   # Random seed for negative sampling
   negative_sampling_seed: 42
