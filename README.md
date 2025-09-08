@@ -107,7 +107,7 @@ Create and activate a conda environment:
 ```bash
 # TODO: Add specific conda environment creation commands
 # Example structure:
-# conda create -n phi_pu_xor python=3.10
+# conda create -n phi_pu_xor python=3.9
 # conda activate phi_pu_xor
 # pip install -r requirements.txt
 ```
