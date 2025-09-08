@@ -27,6 +27,7 @@ phi_pos_unlabeled/
 ├── scripts/                       # Executable scripts
 │   ├── simple_splitting.py        # Data splitting with RBP deduplication  ✅
 │   ├── graph_based_splitting.py  # Alternative graph-based splitting  ✅
+│   ├── extract_sequences.py      # Extract and deduplicate sequences  ✅
 │   └── generate_embeddings.py    # ESM-2 embedding generation  ✅
 ├── slurm/                         # HPC job submission scripts
 │   └── generate_embeddings.sh    # SLURM script for Biowulf  ✅
@@ -113,15 +114,38 @@ Val: ~4,375 samples (17.6%)
 Test: ~4,363 samples (17.6%)
 ```
 
-#### Step 2: Generate Protein Embeddings
+#### Step 2: Extract and Deduplicate Sequences
 
-Generate ESM-2 embeddings for all unique protein sequences:
+Extract all unique protein sequences from the dataset:
+
+```bash
+python scripts/extract_sequences.py \
+    --data_path data/dedup.phage_marker_rbp_with_phage_entropy.tsv \
+    --output_dir data/sequences
+```
+
+This will:
+- Extract and deduplicate all host and phage protein sequences
+- Handle problematic comma-separated sequences
+- Save to separate JSON and FASTA files
+- Create mapping file for reconstruction
+
+Output files:
+- `data/sequences/host_sequences.json` - 2,907 unique host proteins
+- `data/sequences/phage_sequences.json` - 22,310 unique phage proteins
+- `data/sequences/sequence_mappings.tsv` - Interaction mappings
+
+#### Step 3: Generate Protein Embeddings
+
+Generate ESM-2 embeddings for the extracted sequences:
 
 ```bash
 # For local testing (if you have GPU)
 python scripts/generate_embeddings.py \
-    --data_path data/dedup.phage_marker_rbp_with_phage_entropy.tsv \
-    --output_dir data/processed \
+    --host_sequences data/sequences/host_sequences.json \
+    --phage_sequences data/sequences/phage_sequences.json \
+    --model_path /path/to/esm2_t33_650M_UR50D.pt \
+    --output_dir data/embeddings \
     --batch_size 8 \
     --device cuda
 
@@ -130,17 +154,20 @@ sbatch slurm/generate_embeddings.sh
 ```
 
 Parameters:
+- `--model_path`: Path to ESM-2 checkpoint file (.pt format)
 - `--batch_size`: Number of sequences to process at once (adjust based on GPU memory)
-- `--max_length`: Maximum sequence length (default: 1024)
-- `--checkpoint_dir`: Directory for resumable checkpoints
 - `--device`: cuda or cpu
+- `--no_resume`: Don't resume from existing embeddings
 
 The script will:
-- Extract all unique protein sequences (~25,000)
-- Generate 1280-dimensional ESM-2 embeddings
-- Save embeddings to `data/processed/protein_embeddings.h5`
-- Support checkpoint/resume for long runs
-- Log progress to `logs/`
+- Load ESM-2 model from local checkpoint
+- Generate 1280-dimensional embeddings separately for host and phage proteins
+- Save embeddings to HDF5 files with resumable processing
+- Support PyTorch 2.6+ compatibility
+
+Output files:
+- `data/embeddings/host_embeddings.h5` - Host protein embeddings
+- `data/embeddings/phage_embeddings.h5` - Phage protein embeddings
 
 ### 3. Monitoring Progress
 
