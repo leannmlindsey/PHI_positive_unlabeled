@@ -59,13 +59,18 @@ def load_embeddings(embeddings_dir):
 
 def prepare_simple_dataset(data_path, splits_path, host_embeddings, phage_embeddings):
     """
-    Prepare simple dataset with single marker-RBP pairs
+    Prepare simple dataset with single host-phage protein pairs
     """
     logger = logging.getLogger(__name__)
     
-    # Load data
+    # Load data with hash columns
     logger.info(f"Loading data from {data_path}")
     df = pd.read_csv(data_path, sep='\t')
+    
+    # Check if required columns exist
+    if 'host_md5_set' not in df.columns or 'phage_md5_set' not in df.columns:
+        logger.error(f"Required columns not found. Available columns: {df.columns.tolist()}")
+        raise ValueError("Data file must contain 'host_md5_set' and 'phage_md5_set' columns")
     
     # Load splits
     with open(splits_path, 'rb') as f:
@@ -77,63 +82,86 @@ def prepare_simple_dataset(data_path, splits_path, host_embeddings, phage_embedd
     for split_name in ['train', 'val', 'test']:
         logger.info(f"Processing {split_name} split...")
         
-        split_indices = splits[f'{split_name}_idx']
-        split_df = df.iloc[split_indices]
+        # Get split data
+        if f'{split_name}_idx' in splits:
+            # Index-based split
+            split_indices = splits[f'{split_name}_idx']
+            split_df = df.iloc[split_indices]
+        else:
+            # DataFrame-based split
+            split_df = splits[split_name]
         
         positive_pairs = []
         positive_features = []
         
-        # Extract positive pairs (only single marker + single RBP)
-        skipped = 0
-        for _, row in tqdm(split_df.iterrows(), total=len(split_df), desc=f"Processing {split_name}"):
-            # Parse markers
-            marker_field = str(row['marker_md5'])
-            if ',' in marker_field:
-                # Skip multi-marker cases for simplicity
-                markers = marker_field.split(',')
-            else:
-                markers = [marker_field.strip()]
-            
-            # Parse RBPs
-            rbp_field = str(row['rbp_md5'])
-            if ',' in rbp_field:
-                # Skip multi-RBP cases for simplicity
-                skipped += 1
-                continue
-            else:
-                rbps = [rbp_field.strip()]
-            
-            # Only use single marker + single RBP
-            if len(markers) == 1 and len(rbps) == 1:
-                marker_hash = markers[0]
-                rbp_hash = rbps[0]
-                
-                # Check if embeddings exist
-                if marker_hash in host_embeddings and rbp_hash in phage_embeddings:
-                    # Concatenate embeddings
-                    marker_emb = host_embeddings[marker_hash]
-                    rbp_emb = phage_embeddings[rbp_hash]
-                    feature = np.concatenate([marker_emb, rbp_emb])
-                    
-                    positive_pairs.append((marker_hash, rbp_hash))
-                    positive_features.append(feature)
+        # Extract positive pairs (only single host + single phage protein)
+        skipped_multi_host = 0
+        skipped_multi_phage = 0
+        skipped_missing = 0
         
-        logger.info(f"  Collected {len(positive_pairs)} positive pairs (skipped {skipped} multi-RBP)")
+        for _, row in tqdm(split_df.iterrows(), total=len(split_df), desc=f"Processing {split_name}"):
+            # Parse host hashes
+            host_field = str(row['host_md5_set']).strip()
+            if not host_field or host_field == 'nan' or host_field == '':
+                skipped_missing += 1
+                continue
+                
+            if ',' in host_field:
+                # For multi-host, just take the first one for simplicity
+                host_hashes = [h.strip() for h in host_field.split(',') if h.strip()]
+                if len(host_hashes) > 1:
+                    skipped_multi_host += 1
+                host_hash = host_hashes[0] if host_hashes else None
+            else:
+                host_hash = host_field
+            
+            # Parse phage hashes
+            phage_field = str(row['phage_md5_set']).strip()
+            if not phage_field or phage_field == 'nan' or phage_field == '':
+                skipped_missing += 1
+                continue
+                
+            if ',' in phage_field:
+                # For multi-phage, skip for baseline simplicity
+                phage_hashes = [p.strip() for p in phage_field.split(',') if p.strip()]
+                if len(phage_hashes) > 1:
+                    skipped_multi_phage += 1
+                    continue
+                phage_hash = phage_hashes[0] if phage_hashes else None
+            else:
+                phage_hash = phage_field
+            
+            # Check if we have valid single protein pair
+            if host_hash and phage_hash:
+                # Check if embeddings exist
+                if host_hash in host_embeddings and phage_hash in phage_embeddings:
+                    # Concatenate embeddings
+                    host_emb = host_embeddings[host_hash]
+                    phage_emb = phage_embeddings[phage_hash]
+                    feature = np.concatenate([host_emb, phage_emb])
+                    
+                    positive_pairs.append((host_hash, phage_hash))
+                    positive_features.append(feature)
+                else:
+                    skipped_missing += 1
+        
+        logger.info(f"  Collected {len(positive_pairs)} positive pairs")
+        logger.info(f"    Skipped: {skipped_multi_host} multi-host, {skipped_multi_phage} multi-phage, {skipped_missing} missing embeddings")
         
         # Generate negative pairs (same number as positive)
         negative_pairs = []
         negative_features = []
         
-        # Get all unique markers and RBPs in this split
-        all_markers = set()
-        all_rbps = set()
+        # Get all unique host and phage proteins in this split
+        all_hosts = set()
+        all_phages = set()
         
-        for marker_hash, rbp_hash in positive_pairs:
-            all_markers.add(marker_hash)
-            all_rbps.add(rbp_hash)
+        for host_hash, phage_hash in positive_pairs:
+            all_hosts.add(host_hash)
+            all_phages.add(phage_hash)
         
-        all_markers = list(all_markers)
-        all_rbps = list(all_rbps)
+        all_hosts = list(all_hosts)
+        all_phages = list(all_phages)
         
         # Create set of positive pairs for checking
         positive_set = set(positive_pairs)
@@ -147,17 +175,17 @@ def prepare_simple_dataset(data_path, splits_path, host_embeddings, phage_embedd
             attempts += 1
             
             # Random pairing
-            marker_hash = np.random.choice(all_markers)
-            rbp_hash = np.random.choice(all_rbps)
+            host_hash = np.random.choice(all_hosts)
+            phage_hash = np.random.choice(all_phages)
             
             # Check if this is not a positive pair
-            if (marker_hash, rbp_hash) not in positive_set:
+            if (host_hash, phage_hash) not in positive_set:
                 # Create feature
-                marker_emb = host_embeddings[marker_hash]
-                rbp_emb = phage_embeddings[rbp_hash]
-                feature = np.concatenate([marker_emb, rbp_emb])
+                host_emb = host_embeddings[host_hash]
+                phage_emb = phage_embeddings[phage_hash]
+                feature = np.concatenate([host_emb, phage_emb])
                 
-                negative_pairs.append((marker_hash, rbp_hash))
+                negative_pairs.append((host_hash, phage_hash))
                 negative_features.append(feature)
         
         logger.info(f"  Generated {len(negative_pairs)} negative pairs")
@@ -259,8 +287,8 @@ def evaluate_model(model, X, y, name="Test"):
 def main():
     parser = argparse.ArgumentParser(description="Simple XGBoost baseline for phage-host interaction")
     parser.add_argument("--data_path", type=str, 
-                       default="data/dedup.phage_marker_rbp_with_phage_entropy.tsv",
-                       help="Path to data file")
+                       default="data/dedup.labeled_marker_rbp_phageID_with_hashes.tsv",
+                       help="Path to data file with hash columns")
     parser.add_argument("--splits_path", type=str,
                        default="data/processed/splits.pkl",
                        help="Path to splits file")
@@ -317,10 +345,10 @@ def main():
         y_prob = model.predict(dtest)
         
         results = pd.DataFrame({
-            'marker_hash': [p[0] for p in datasets[split_name]['positive_pairs']] + 
-                          [p[0] for p in datasets[split_name]['negative_pairs']],
-            'rbp_hash': [p[1] for p in datasets[split_name]['positive_pairs']] + 
-                       [p[1] for p in datasets[split_name]['negative_pairs']],
+            'host_hash': [p[0] for p in datasets[split_name]['positive_pairs']] + 
+                        [p[0] for p in datasets[split_name]['negative_pairs']],
+            'phage_hash': [p[1] for p in datasets[split_name]['positive_pairs']] + 
+                         [p[1] for p in datasets[split_name]['negative_pairs']],
             'true_label': datasets[split_name]['y'],
             'predicted_prob': y_prob
         })
