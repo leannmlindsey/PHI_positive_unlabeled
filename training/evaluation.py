@@ -74,14 +74,14 @@ def compute_metrics(
         except ValueError:
             metrics['auprc'] = np.mean(labels)
             
-    # Top-K metrics
-    if k_values is not None:
-        for k in k_values:
-            hit_at_k = compute_hit_at_k(labels, probabilities, k)
-            recall_at_k = compute_recall_at_k(labels, probabilities, k)
-            
-            metrics[f'hit@{k}'] = hit_at_k
-            metrics[f'recall@{k}'] = recall_at_k
+    # Top-K metrics - removed for now, will be implemented later for experimental test set
+    # if k_values is not None:
+    #     for k in k_values:
+    #         hit_at_k = compute_hit_at_k(labels, probabilities, k)
+    #         recall_at_k = compute_recall_at_k(labels, probabilities, k)
+    #         
+    #         metrics[f'hit@{k}'] = hit_at_k
+    #         metrics[f'recall@{k}'] = recall_at_k
             
     return metrics
 

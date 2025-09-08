@@ -112,15 +112,18 @@ class Trainer:
         return PhageHostDataModule(
             data_path=self.config['data']['data_path'],
             splits_path=self.config['data']['splits_path'],
-            embeddings_path=self.config['data']['embeddings_path'],
+            embeddings_dir=self.config['data']['embeddings_path'],  # Changed to embeddings_dir
             batch_size=self.config['training']['batch_size'],
-            negative_ratio=self.config['dataset']['negative_ratio'],
-            max_markers=self.config['dataset']['max_markers'],
-            max_rbps=self.config['dataset']['max_rbps'],
+            max_hosts=self.config['dataset']['max_markers'],  # Changed to max_hosts
+            max_phages=self.config['dataset']['max_rbps'],    # Changed to max_phages
+            negative_ratio_train=self.config['dataset']['negative_ratio'],
+            negative_ratio_val=self.config['dataset']['val_negative_ratio'],
+            negative_ratio_test=self.config['dataset']['test_negative_ratio'],
             num_workers=self.config['dataset']['num_workers'],
             pin_memory=self.config['dataset']['pin_memory'],
             augment_train=True,
-            seed=self.config['seeds']['random_seed'],
+            cache_size=10000,
+            preload_all=False,
             logger=self.logger
         )
         
@@ -300,6 +303,12 @@ class Trainer:
         total_positive_risk = 0
         total_negative_risk = 0
         total_samples = 0
+        total_grad_norm = 0
+        grad_samples = 0
+        
+        # Track predictions for debugging
+        all_predictions = []
+        all_labels = []
         
         train_loader = self.data_module.train_dataloader()
         
@@ -310,6 +319,9 @@ class Trainer:
         # Zero gradients at start
         self.optimizer.zero_grad()
         
+        # Debug flag for first batch
+        debug_first_batch = True
+        
         with tqdm(train_loader, desc=f"Epoch {epoch+1} Training") as pbar:
             for batch_idx, batch in enumerate(pbar):
                 # Move batch to device
@@ -319,6 +331,29 @@ class Trainer:
                 rbp_mask = batch['rbp_mask'].to(self.device)
                 labels = batch['label'].to(self.device)
                 
+                # Debug first batch
+                if debug_first_batch and batch_idx == 0:
+                    self.logger.info("\n=== First Batch Debug Info ===")
+                    self.logger.info(f"Marker embeddings shape: {marker_embeddings.shape}")
+                    self.logger.info(f"RBP embeddings shape: {rbp_embeddings.shape}")
+                    self.logger.info(f"Marker mask shape: {marker_mask.shape}")
+                    self.logger.info(f"RBP mask shape: {rbp_mask.shape}")
+                    self.logger.info(f"Labels shape: {labels.shape}")
+                    self.logger.info(f"Positive samples in batch: {labels.sum().item()}/{labels.shape[0]}")
+                    
+                    # Check if embeddings are non-zero
+                    marker_nonzero = (marker_embeddings != 0).any().item()
+                    rbp_nonzero = (rbp_embeddings != 0).any().item()
+                    self.logger.info(f"Marker embeddings non-zero: {marker_nonzero}")
+                    self.logger.info(f"RBP embeddings non-zero: {rbp_nonzero}")
+                    
+                    # Check mask validity
+                    marker_valid = marker_mask.sum(dim=1)
+                    rbp_valid = rbp_mask.sum(dim=1)
+                    self.logger.info(f"Valid markers per sample: min={marker_valid.min().item()}, max={marker_valid.max().item()}, mean={marker_valid.mean().item():.2f}")
+                    self.logger.info(f"Valid RBPs per sample: min={rbp_valid.min().item()}, max={rbp_valid.max().item()}, mean={rbp_valid.mean().item():.2f}")
+                    debug_first_batch = False
+                
                 # Forward pass
                 outputs = self.model(
                     marker_embeddings,
@@ -327,8 +362,20 @@ class Trainer:
                     rbp_mask
                 )
                 
+                # Debug predictions
+                if batch_idx == 0:
+                    self.logger.info(f"\nModel output probabilities: min={outputs['bag_probs'].min().item():.4f}, max={outputs['bag_probs'].max().item():.4f}, mean={outputs['bag_probs'].mean().item():.4f}")
+                
+                # Store predictions for analysis
+                all_predictions.extend(outputs['bag_probs'].detach().cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                
                 # Compute loss
                 loss_dict = self.criterion(outputs['bag_probs'], labels)
+                
+                # Debug loss components
+                if batch_idx == 0:
+                    self.logger.info(f"Loss components - Total: {loss_dict['loss'].item():.4f}, Pos risk: {loss_dict['positive_risk'].item():.4f}, Neg risk: {loss_dict['negative_risk'].item():.4f}")
                 
                 # Scale loss by accumulation steps to maintain effective learning rate
                 loss = loss_dict['loss'] / accumulation_steps
@@ -338,6 +385,25 @@ class Trainer:
                 
                 # Perform optimizer step every accumulation_steps batches
                 if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                    # Calculate gradient norm before clipping
+                    grad_norm = 0
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            grad_norm += p.grad.data.norm(2).item() ** 2
+                    grad_norm = grad_norm ** 0.5
+                    total_grad_norm += grad_norm
+                    grad_samples += 1
+                    
+                    # Log gradient info for first few batches
+                    if batch_idx < 5:
+                        self.logger.info(f"Batch {batch_idx} gradient norm (before clipping): {grad_norm:.4f}")
+                        
+                        # Check for gradient explosion or vanishing
+                        if grad_norm > 100:
+                            self.logger.warning(f"Large gradient norm detected: {grad_norm:.4f}")
+                        elif grad_norm < 1e-6:
+                            self.logger.warning(f"Small gradient norm detected: {grad_norm:.4f}")
+                    
                     # Gradient clipping (applied to accumulated gradients)
                     if self.config['training']['gradient_clip'] > 0:
                         nn.utils.clip_grad_norm_(
@@ -399,8 +465,40 @@ class Trainer:
         metrics = {
             'loss': total_loss / total_samples,
             'positive_risk': total_positive_risk / total_samples,
-            'negative_risk': total_negative_risk / total_samples
+            'negative_risk': total_negative_risk / total_samples,
+            'avg_grad_norm': total_grad_norm / grad_samples if grad_samples > 0 else 0
         }
+        
+        # Analyze predictions
+        all_predictions = np.array(all_predictions)
+        all_labels = np.array(all_labels)
+        
+        # Calculate basic metrics
+        threshold = 0.5
+        predictions_binary = (all_predictions > threshold).astype(float)
+        accuracy = (predictions_binary == all_labels).mean()
+        
+        # Separate positive and negative predictions
+        pos_preds = all_predictions[all_labels == 1]
+        neg_preds = all_predictions[all_labels == 0]
+        
+        self.logger.info(f"\n=== Epoch {epoch+1} Training Analysis ===")
+        self.logger.info(f"Prediction statistics:")
+        self.logger.info(f"  All predictions: min={all_predictions.min():.4f}, max={all_predictions.max():.4f}, mean={all_predictions.mean():.4f}, std={all_predictions.std():.4f}")
+        if len(pos_preds) > 0:
+            self.logger.info(f"  Positive class predictions: mean={pos_preds.mean():.4f}, std={pos_preds.std():.4f}")
+        if len(neg_preds) > 0:
+            self.logger.info(f"  Negative class predictions: mean={neg_preds.mean():.4f}, std={neg_preds.std():.4f}")
+        self.logger.info(f"  Training accuracy: {accuracy:.4f}")
+        self.logger.info(f"  Average gradient norm: {metrics['avg_grad_norm']:.4f}")
+        
+        # Check if model is predicting all same value
+        pred_variance = all_predictions.var()
+        if pred_variance < 1e-6:
+            self.logger.warning(f"WARNING: Model predictions have very low variance ({pred_variance:.6f}). Model may be stuck!")
+        
+        metrics['accuracy'] = accuracy
+        metrics['pred_variance'] = pred_variance
         
         return metrics
         
@@ -467,7 +565,7 @@ class Trainer:
             np.array(all_predictions),
             np.array(all_probabilities),
             self.config['evaluation']['metrics'],
-            self.config['evaluation']['k_values']
+            None  # k_values disabled for training
         )
         
         metrics['loss'] = total_loss / total_samples
@@ -796,7 +894,7 @@ class Trainer:
             np.array(all_predictions),
             np.array(all_probabilities),
             self.config['evaluation']['metrics'],
-            self.config['evaluation']['k_values']
+            None  # k_values disabled for training
         )
         
         self.logger.info("Test metrics:")

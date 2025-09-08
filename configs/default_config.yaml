@@ -171,8 +171,8 @@ evaluation:
     - "auroc"
     - "auprc"
   
-  # Compute Hit@K and Recall@K for these values
-  k_values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  # Compute Hit@K and Recall@K - disabled for training, will be computed on experimental test set
+  # k_values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
   
   # Threshold for binary classification
   classification_threshold: 0.5
