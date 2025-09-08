@@ -29,7 +29,7 @@ mkdir -p data/processed
 
 # Set the local model path (update this to your actual path)
 # You can pass this as an environment variable or command line argument
-ESM2_MODEL_PATH="${ESM2_MODEL_PATH:-/data/$USER/models/esm2_t33_650M_UR50D}"
+ESM2_MODEL_PATH="${ESM2_MODEL_PATH:-/gpfs/gsfs12/users/lindseylm/PHAGE_HOST_INTERACTION/esm_models/checkpoints/esm2_t33_650M_UR50D.pt}"
 
 echo "Using ESM-2 model from: $ESM2_MODEL_PATH"
 

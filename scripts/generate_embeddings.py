@@ -97,7 +97,13 @@ class ProteinSequenceExtractor:
             marker_seqs = row['marker_gene_seq'].split(',')
             marker_hashes = row['marker_md5'].split(',') if ',' in str(row['marker_md5']) else [row['marker_md5']]
             
+            # Ensure we have the same number of sequences and hashes
+            if len(marker_seqs) != len(marker_hashes):
+                self.logger.warning(f"Row {idx}: Mismatch in marker counts - {len(marker_seqs)} seqs, {len(marker_hashes)} hashes")
+                continue
+                
             for seq, hash_val in zip(marker_seqs, marker_hashes):
+                seq = seq.strip()  # Remove any whitespace
                 if hash_val not in self.unique_sequences:
                     self.unique_sequences[hash_val] = seq
                     
@@ -106,7 +112,13 @@ class ProteinSequenceExtractor:
             rbp_seqs = row['rbp_seq'].split(',')
             rbp_hashes = row['rbp_md5'].split(',') if ',' in str(row['rbp_md5']) else [row['rbp_md5']]
             
+            # Ensure we have the same number of sequences and hashes
+            if len(rbp_seqs) != len(rbp_hashes):
+                self.logger.warning(f"Row {idx}: Mismatch in RBP counts - {len(rbp_seqs)} seqs, {len(rbp_hashes)} hashes")
+                continue
+                
             for seq, hash_val in zip(rbp_seqs, rbp_hashes):
+                seq = seq.strip()  # Remove any whitespace
                 if hash_val not in self.unique_sequences:
                     self.unique_sequences[hash_val] = seq
                     
@@ -195,21 +207,38 @@ class ESM2EmbeddingGenerator:
             try:
                 import esm
                 
-                # Load the model using fair-esm
-                model, alphabet = esm.pretrained.load_model_and_alphabet_local(self.model_path)
-                self.model = model
-                self.alphabet = alphabet
-                self.tokenizer = alphabet  # Use alphabet as tokenizer for fair-esm
-                self.use_fair_esm = True
+                # For PyTorch 2.6+, we need to handle weights_only issue
+                # Temporarily monkey-patch the load function to use weights_only=False
+                import torch
+                original_load = torch.load
                 
-                # Get embedding dimension
-                if hasattr(self.model, 'embed_dim'):
-                    self.embedding_dim = self.model.embed_dim
-                elif hasattr(self.model, 'args') and hasattr(self.model.args, 'embed_dim'):
-                    self.embedding_dim = self.model.args.embed_dim
-                else:
-                    # Default for ESM2_t33_650M
-                    self.embedding_dim = 1280
+                def patched_load(f, *args, **kwargs):
+                    # Force weights_only=False for fair-esm models
+                    kwargs['weights_only'] = False
+                    return original_load(f, *args, **kwargs)
+                
+                # Apply patch
+                torch.load = patched_load
+                
+                try:
+                    # Load the model using fair-esm
+                    model, alphabet = esm.pretrained.load_model_and_alphabet_local(self.model_path)
+                    self.model = model
+                    self.alphabet = alphabet
+                    self.tokenizer = alphabet  # Use alphabet as tokenizer for fair-esm
+                    self.use_fair_esm = True
+                    
+                    # Get embedding dimension
+                    if hasattr(self.model, 'embed_dim'):
+                        self.embedding_dim = self.model.embed_dim
+                    elif hasattr(self.model, 'args') and hasattr(self.model.args, 'embed_dim'):
+                        self.embedding_dim = self.model.args.embed_dim
+                    else:
+                        # Default for ESM2_t33_650M
+                        self.embedding_dim = 1280
+                finally:
+                    # Restore original load function
+                    torch.load = original_load
                     
             except ImportError:
                 self.logger.error("fair-esm library not found. Install with: pip install fair-esm")
