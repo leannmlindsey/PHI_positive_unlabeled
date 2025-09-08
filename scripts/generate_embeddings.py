@@ -1,6 +1,6 @@
 """
-Simple ESM-2 Embedding Generation Script
-Generates embeddings from cleaned sequence files
+ESM-2 Embedding Generation Script using MD5 hashes
+Generates embeddings from deduplicated sequence files with MD5 hash identifiers
 """
 
 import os
@@ -8,12 +8,13 @@ import sys
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 import numpy as np
 import torch
 import h5py
 from tqdm import tqdm
 import logging
+import hashlib
 
 
 def setup_logging(name: str = __name__) -> logging.Logger:
@@ -27,7 +28,7 @@ def setup_logging(name: str = __name__) -> logging.Logger:
 
 
 class ESM2Embedder:
-    """Simple ESM-2 embedder for cleaned sequences"""
+    """ESM-2 embedder for sequences identified by MD5 hashes"""
     
     def __init__(self, model_path: str, device: str = 'cuda', batch_size: int = 8):
         """
@@ -48,375 +49,272 @@ class ESM2Embedder:
         self.batch_converter = None
         
     def load_model(self):
-        """Load the ESM-2 model"""
+        """Load ESM-2 model from checkpoint"""
         self.logger.info(f"Loading ESM-2 model from {self.model_path}")
         
+        # Check PyTorch version for compatibility
+        torch_version = torch.__version__
+        self.logger.info(f"PyTorch version: {torch_version}")
+        
         try:
+            # Load model checkpoint
+            checkpoint = torch.load(self.model_path, map_location=self.device)
+            
+            # Import ESM after confirming we can load the checkpoint
             import esm
             
-            # Monkey-patch torch.load for PyTorch 2.6+ compatibility
-            import torch
-            original_load = torch.load
+            # Get model info from checkpoint
+            if 'cfg' in checkpoint:
+                # This is a fairseq checkpoint
+                model_name = checkpoint['cfg']['model'].get('_name', 'esm2_t33_650M_UR50D')
+            else:
+                # Default to t33_650M model
+                model_name = 'esm2_t33_650M_UR50D'
             
-            def patched_load(f, *args, **kwargs):
-                kwargs['weights_only'] = False
-                return original_load(f, *args, **kwargs)
+            self.logger.info(f"Model architecture: {model_name}")
             
-            torch.load = patched_load
+            # Load model and alphabet based on architecture
+            if 't33_650M' in model_name or 't33' in self.model_path.lower():
+                self.model, self.alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+                expected_layers = 33
+            elif 't30_150M' in model_name or 't30' in self.model_path.lower():
+                self.model, self.alphabet = esm.pretrained.esm2_t30_150M_UR50D()
+                expected_layers = 30
+            elif 't36_3B' in model_name or 't36' in self.model_path.lower():
+                self.model, self.alphabet = esm.pretrained.esm2_t36_3B_UR50D()
+                expected_layers = 36
+            elif 't48_15B' in model_name or 't48' in self.model_path.lower():
+                self.model, self.alphabet = esm.pretrained.esm2_t48_15B_UR50D()
+                expected_layers = 48
+            else:
+                # Default to t33
+                self.logger.warning(f"Unknown model architecture, defaulting to t33_650M")
+                self.model, self.alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+                expected_layers = 33
             
-            try:
-                # Load model
-                self.model, self.alphabet = esm.pretrained.load_model_and_alphabet_local(self.model_path)
-                self.batch_converter = self.alphabet.get_batch_converter()
-                self.model = self.model.to(self.device)
-                self.model.eval()
-                
-                # Get embedding dimension
-                if hasattr(self.model, 'embed_dim'):
-                    self.embed_dim = self.model.embed_dim
-                elif hasattr(self.model, 'args'):
-                    self.embed_dim = self.model.args.embed_dim
-                else:
-                    self.embed_dim = 1280  # Default for t33_650M
-                    
-                self.logger.info(f"Model loaded successfully. Embedding dimension: {self.embed_dim}")
-                
-            finally:
-                # Restore original torch.load
-                torch.load = original_load
-                
-        except ImportError:
-            self.logger.error("fair-esm not installed. Install with: pip install fair-esm")
-            raise
+            # Load weights from checkpoint
+            if 'model' in checkpoint:
+                model_state = checkpoint['model']
+            elif 'state_dict' in checkpoint:
+                model_state = checkpoint['state_dict']
+            else:
+                model_state = checkpoint
+            
+            # Filter out unexpected keys
+            model_keys = set(self.model.state_dict().keys())
+            filtered_state = {k: v for k, v in model_state.items() if k in model_keys}
+            
+            # Load the filtered state
+            self.model.load_state_dict(filtered_state, strict=False)
+            
+            self.logger.info(f"Loaded {len(filtered_state)}/{len(model_state)} parameters")
+            
         except Exception as e:
-            self.logger.error(f"Failed to load model: {e}")
-            raise
-    
-    def embed_batch(self, sequences: list) -> np.ndarray:
+            self.logger.error(f"Failed to load model from checkpoint: {e}")
+            self.logger.info("Falling back to downloading pre-trained model")
+            
+            import esm
+            self.model, self.alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+        
+        # Set up batch converter
+        self.batch_converter = self.alphabet.get_batch_converter()
+        
+        # Move model to device and set to eval mode
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        
+        # Get embedding dimension
+        self.embedding_dim = self.model.args.embed_dim if hasattr(self.model, 'args') else 1280
+        self.logger.info(f"Model loaded successfully. Embedding dimension: {self.embedding_dim}")
+        
+    def generate_embeddings(self, sequences: Dict[str, str]) -> Dict[str, np.ndarray]:
         """
-        Generate embeddings for a batch of sequences with adaptive batching
+        Generate embeddings for sequences
         
         Args:
-            sequences: List of (label, sequence) tuples
+            sequences: Dictionary mapping MD5 hash to sequence
             
         Returns:
-            Array of embeddings
-        """
-        # Sort sequences by length for better memory estimation
-        sequences = sorted(sequences, key=lambda x: len(x[1]))
-        max_seq_len = len(sequences[-1][1])
-        
-        # Very conservative memory estimation for safety
-        # Each sequence needs roughly max_seq_len^2 * 4 bytes per attention layer
-        safe_batch_size = 1
-        if max_seq_len < 500:
-            safe_batch_size = 8
-        elif max_seq_len < 1000:
-            safe_batch_size = 4
-        elif max_seq_len < 2000:
-            safe_batch_size = 2
-        elif max_seq_len < 5000:
-            safe_batch_size = 1
-        
-        # Process in smaller batches if needed
-        if len(sequences) > safe_batch_size:
-            self.logger.info(f"Processing {len(sequences)} sequences in batches of {safe_batch_size} (max_len={max_seq_len})")
-            all_embeddings = []
-            
-            for i in range(0, len(sequences), safe_batch_size):
-                batch = sequences[i:i+safe_batch_size]
-                try:
-                    # Recursively process smaller batch
-                    batch_emb = self.embed_batch(batch)
-                    all_embeddings.extend(batch_emb)
-                except torch.cuda.OutOfMemoryError:
-                    # If even smaller batch fails, process individually
-                    self.logger.warning(f"Batch of {len(batch)} failed, processing individually")
-                    for seq in batch:
-                        emb = self.embed_batch([seq])
-                        all_embeddings.extend(emb)
-                
-                # Clear cache between batches
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    
-            return np.array(all_embeddings)
-        
-        # Try to process the batch
-        try:
-            batch_labels, batch_strs, batch_tokens = self.batch_converter(sequences)
-            batch_tokens = batch_tokens.to(self.device)
-            
-            with torch.no_grad():
-                results = self.model(batch_tokens, repr_layers=[33], return_contacts=False)
-                token_embeddings = results["representations"][33]
-            
-            # Extract embeddings and apply mean pooling
-            embeddings = []
-            for i, (_, seq) in enumerate(sequences):
-                seq_len = len(seq)
-                # Remove BOS/EOS tokens and mean pool
-                seq_embeddings = token_embeddings[i, 1:seq_len+1]
-                pooled = seq_embeddings.mean(dim=0)
-                embeddings.append(pooled.cpu().numpy())
-            
-            return np.array(embeddings)
-            
-        except torch.cuda.OutOfMemoryError as e:
-            # If batch processing fails, fall back to individual processing
-            self.logger.warning(f"Batch processing failed with OOM, processing {len(sequences)} sequences individually")
-            embeddings = []
-            
-            for label, seq in sequences:
-                try:
-                    # Clear cache before each sequence
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                    # Process single sequence
-                    single_batch = [(label, seq)]
-                    batch_labels, batch_strs, batch_tokens = self.batch_converter(single_batch)
-                    batch_tokens = batch_tokens.to(self.device)
-                    
-                    with torch.no_grad():
-                        results = self.model(batch_tokens, repr_layers=[33], return_contacts=False)
-                        token_embeddings = results["representations"][33]
-                    
-                    # Extract embedding
-                    seq_len = len(seq)
-                    seq_embeddings = token_embeddings[0, 1:seq_len+1]
-                    pooled = seq_embeddings.mean(dim=0)
-                    embeddings.append(pooled.cpu().numpy())
-                    
-                except Exception as e2:
-                    self.logger.error(f"Failed to process sequence of length {len(seq)}: {e2}")
-                    # Return zero embedding for failed sequences
-                    embeddings.append(np.zeros(self.embed_dim))
-                    
-            return np.array(embeddings)
-    
-    def process_sequences(self, sequences: Dict[str, str], output_path: str, 
-                         desc: str = "Processing", resume: bool = True):
-        """
-        Process all sequences and save embeddings
-        
-        Args:
-            sequences: Dictionary mapping hash/id to sequence
-            output_path: Path to save HDF5 file
-            desc: Description for progress bar
-            resume: Whether to resume from existing file
+            Dictionary mapping MD5 hash to embedding
         """
         if self.model is None:
             self.load_model()
         
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        embeddings = {}
         
-        # Check for existing embeddings
-        processed_hashes = set()
-        if resume and output_path.exists():
-            with h5py.File(output_path, 'r') as f:
-                if 'hashes' in f:
-                    processed_hashes = set(f['hashes'][:].astype(str))
-                    self.logger.info(f"Found {len(processed_hashes)} existing embeddings")
+        # Process in batches
+        hash_list = list(sequences.keys())
+        n_batches = (len(hash_list) + self.batch_size - 1) // self.batch_size
         
-        # Filter sequences to process
-        to_process = {h: s for h, s in sequences.items() if h not in processed_hashes}
-        
-        if not to_process:
-            self.logger.info("All sequences already processed")
-            return
-        
-        self.logger.info(f"Processing {len(to_process)} sequences")
-        
-        # Sort sequences by length for efficient batching
-        # This ensures similar-length sequences are processed together
-        seq_with_hash = [(hash_val, seq, len(seq)) for hash_val, seq in to_process.items()]
-        seq_with_hash.sort(key=lambda x: x[2])  # Sort by sequence length
-        
-        # Group sequences by length buckets for optimal memory usage
-        length_buckets = []
-        current_bucket = []
-        current_max_len = 0
-        
-        for hash_val, seq, seq_len in seq_with_hash:
-            # Start new bucket if length difference is too large
-            if current_bucket and (seq_len > current_max_len * 1.5 or seq_len > current_max_len + 500):
-                length_buckets.append(current_bucket)
-                current_bucket = []
-                current_max_len = 0
-            
-            current_bucket.append((hash_val, seq))
-            current_max_len = max(current_max_len, seq_len)
-        
-        if current_bucket:
-            length_buckets.append(current_bucket)
-        
-        self.logger.info(f"Organized sequences into {len(length_buckets)} length-based buckets")
-        
-        # Flatten buckets back for processing but maintain length ordering
-        sorted_data = []
-        for bucket in length_buckets:
-            sorted_data.extend(bucket)
-        
-        hash_list = [item[0] for item in sorted_data]
-        seq_list = [item[1] for item in sorted_data]
-        
-        # Open HDF5 file
-        mode = 'a' if resume and output_path.exists() else 'w'
-        with h5py.File(output_path, mode) as f:
-            # Create or get datasets
-            if 'embeddings' not in f:
-                embeddings_ds = f.create_dataset(
-                    'embeddings',
-                    shape=(0, self.embed_dim),
-                    maxshape=(None, self.embed_dim),
-                    dtype='float32',
-                    chunks=(100, self.embed_dim)
-                )
-                hashes_ds = f.create_dataset(
-                    'hashes',
-                    shape=(0,),
-                    maxshape=(None,),
-                    dtype=h5py.string_dtype()
-                )
-            else:
-                embeddings_ds = f['embeddings']
-                hashes_ds = f['hashes']
-            
-            # Process in batches with dynamic batch sizing based on sequence lengths
-            processed = 0
-            pbar = tqdm(total=len(hash_list), desc=desc)
-            
-            i = 0
-            while i < len(hash_list):
-                # Determine adaptive batch size based on sequence lengths
-                max_len_in_batch = len(seq_list[i])
+        with torch.no_grad():
+            for batch_idx in tqdm(range(n_batches), desc="Generating embeddings"):
+                start_idx = batch_idx * self.batch_size
+                end_idx = min(start_idx + self.batch_size, len(hash_list))
+                batch_hashes = hash_list[start_idx:end_idx]
                 
-                # Adjust batch size based on max length
-                if max_len_in_batch < 500:
-                    adaptive_batch_size = min(self.batch_size * 2, 16)  # Can handle more short sequences
-                elif max_len_in_batch < 1000:
-                    adaptive_batch_size = self.batch_size
-                elif max_len_in_batch < 2000:
-                    adaptive_batch_size = max(self.batch_size // 2, 2)
-                else:
-                    adaptive_batch_size = 1  # Process very long sequences individually
-                
-                # Get batch
-                end_idx = min(i + adaptive_batch_size, len(hash_list))
-                batch_hashes = hash_list[i:end_idx]
-                batch_seqs = seq_list[i:end_idx]
-                
-                # Log batch info for very long sequences
-                max_batch_len = max(len(seq) for seq in batch_seqs)
-                if max_batch_len > 3000:
-                    self.logger.info(f"Processing batch with {len(batch_seqs)} sequences, max length: {max_batch_len}")
-                
-                # Prepare sequences with labels
-                labeled_seqs = [(f"seq_{j}", seq) for j, seq in enumerate(batch_seqs)]
+                # Prepare batch data
+                batch_data = [(hash_id, sequences[hash_id]) for hash_id in batch_hashes]
                 
                 try:
-                    # Generate embeddings
-                    batch_embeddings = self.embed_batch(labeled_seqs)
+                    # Convert sequences
+                    batch_labels, batch_strs, batch_tokens = self.batch_converter(batch_data)
+                    batch_tokens = batch_tokens.to(self.device)
                     
-                    # Resize datasets
-                    current_size = embeddings_ds.shape[0]
-                    new_size = current_size + len(batch_hashes)
+                    # Get embeddings
+                    results = self.model(batch_tokens, repr_layers=[33], return_contacts=False)
+                    batch_embeddings = results["representations"][33]
                     
-                    embeddings_ds.resize((new_size, self.embed_dim))
-                    hashes_ds.resize((new_size,))
-                    
-                    # Add data
-                    embeddings_ds[current_size:new_size] = batch_embeddings
-                    hashes_ds[current_size:new_size] = batch_hashes
-                    
-                    # Flush periodically
-                    if processed % 100 == 0:
-                        f.flush()
-                    
-                    # Update progress
-                    pbar.update(len(batch_hashes))
-                    processed += len(batch_hashes)
-                    
-                    # Move to next batch
-                    i = end_idx
+                    # Extract per-sequence embeddings (mean over length)
+                    for i, hash_id in enumerate(batch_hashes):
+                        seq_len = len(sequences[hash_id])
+                        # Take mean over sequence length (excluding special tokens)
+                        seq_embedding = batch_embeddings[i, 1:seq_len+1].mean(0).cpu().numpy()
+                        embeddings[hash_id] = seq_embedding
                         
                 except Exception as e:
-                    self.logger.error(f"Error processing batch at index {i}: {e}")
-                    raise
-                finally:
-                    # Clear GPU cache after each batch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            
-            pbar.close()
+                    self.logger.error(f"Error processing batch {batch_idx}: {e}")
+                    # Create zero embeddings for failed sequences
+                    for hash_id in batch_hashes:
+                        embeddings[hash_id] = np.zeros(self.embedding_dim, dtype=np.float32)
         
-        self.logger.info(f"Embeddings saved to {output_path}")
+        return embeddings
+    
+    def save_embeddings(self, embeddings: Dict[str, np.ndarray], output_path: str):
+        """
+        Save embeddings to HDF5 file
+        
+        Args:
+            embeddings: Dictionary mapping MD5 hash to embedding
+            output_path: Path to save HDF5 file
+        """
+        self.logger.info(f"Saving {len(embeddings)} embeddings to {output_path}")
+        
+        # Convert to arrays
+        hashes = list(embeddings.keys())
+        embedding_matrix = np.stack([embeddings[h] for h in hashes])
+        
+        # Save to HDF5
+        with h5py.File(output_path, 'w') as f:
+            # Save embeddings
+            f.create_dataset('embeddings', data=embedding_matrix, 
+                           dtype='float32', compression='gzip')
+            
+            # Save MD5 hashes as identifiers
+            f.create_dataset('hashes', data=[h.encode('utf-8') for h in hashes],
+                           dtype=h5py.string_dtype())
+            
+            # Save metadata
+            f.attrs['embedding_dim'] = self.embedding_dim
+            f.attrs['n_sequences'] = len(embeddings)
+            
+        self.logger.info(f"Embeddings saved successfully")
+
+
+def load_sequences_from_json(json_path: str) -> Dict[str, str]:
+    """
+    Load sequences from JSON file with MD5 hash keys
+    
+    Args:
+        json_path: Path to JSON file
+        
+    Returns:
+        Dictionary mapping MD5 hash to sequence
+    """
+    with open(json_path, 'r') as f:
+        sequences = json.load(f)
+    return sequences
+
+
+def verify_embeddings(h5_path: str, sequences: Dict[str, str]) -> bool:
+    """
+    Verify that embeddings match the sequences
+    
+    Args:
+        h5_path: Path to HDF5 file
+        sequences: Dictionary of sequences
+        
+    Returns:
+        True if verification passes
+    """
+    with h5py.File(h5_path, 'r') as f:
+        stored_hashes = set(h.decode('utf-8') for h in f['hashes'][:])
+        sequence_hashes = set(sequences.keys())
+        
+        missing = sequence_hashes - stored_hashes
+        extra = stored_hashes - sequence_hashes
+        
+        if missing:
+            print(f"WARNING: {len(missing)} sequences missing from embeddings")
+        if extra:
+            print(f"WARNING: {len(extra)} extra embeddings not in sequences")
+            
+        return len(missing) == 0
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate ESM-2 embeddings from sequence files")
-    parser.add_argument("--host_sequences", type=str, required=True,
-                       help="Path to host sequences JSON file")
-    parser.add_argument("--phage_sequences", type=str, required=True,
-                       help="Path to phage sequences JSON file")
-    parser.add_argument("--model_path", type=str, required=True,
-                       help="Path to ESM-2 checkpoint file")
-    parser.add_argument("--output_dir", type=str, default="data/embeddings",
-                       help="Output directory for embeddings")
-    parser.add_argument("--batch_size", type=int, default=8,
-                       help="Batch size for processing")
-    parser.add_argument("--device", type=str, default="cuda",
-                       help="Device to use (cuda/cpu)")
-    parser.add_argument("--no_resume", action="store_true",
-                       help="Don't resume from existing embeddings")
+    parser = argparse.ArgumentParser(description='Generate ESM-2 embeddings with MD5 hashes')
+    parser.add_argument('--host_sequences', type=str,
+                       default='data/sequences/dedup_host_sequences.json',
+                       help='Path to host sequences JSON file')
+    parser.add_argument('--phage_sequences', type=str,
+                       default='data/sequences/dedup_phage_sequences.json',
+                       help='Path to phage sequences JSON file')
+    parser.add_argument('--model_path', type=str, required=True,
+                       help='Path to ESM-2 model checkpoint')
+    parser.add_argument('--output_dir', type=str, default='data/embeddings',
+                       help='Directory to save embeddings')
+    parser.add_argument('--batch_size', type=int, default=8,
+                       help='Batch size for processing')
+    parser.add_argument('--device', type=str, default='cuda',
+                       help='Device to use (cuda/cpu)')
+    parser.add_argument('--skip_host', action='store_true',
+                       help='Skip host embedding generation')
+    parser.add_argument('--skip_phage', action='store_true',
+                       help='Skip phage embedding generation')
     
     args = parser.parse_args()
     
-    # Load sequences
-    print(f"Loading host sequences from {args.host_sequences}")
-    with open(args.host_sequences, 'r') as f:
-        host_sequences = json.load(f)
-    print(f"Loaded {len(host_sequences)} host sequences")
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    print(f"Loading phage sequences from {args.phage_sequences}")
-    with open(args.phage_sequences, 'r') as f:
-        phage_sequences = json.load(f)
-    print(f"Loaded {len(phage_sequences)} phage sequences")
-    
-    # Create embedder
+    # Initialize embedder
     embedder = ESM2Embedder(
         model_path=args.model_path,
         device=args.device,
         batch_size=args.batch_size
     )
     
-    # Process sequences
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Generate host embeddings
+    if not args.skip_host:
+        print("\n=== Generating Host Embeddings ===")
+        host_sequences = load_sequences_from_json(args.host_sequences)
+        print(f"Loaded {len(host_sequences)} unique host sequences")
+        
+        host_embeddings = embedder.generate_embeddings(host_sequences)
+        
+        host_output = os.path.join(args.output_dir, 'host_embeddings.h5')
+        embedder.save_embeddings(host_embeddings, host_output)
+        
+        # Verify
+        if verify_embeddings(host_output, host_sequences):
+            print("✓ Host embeddings verified successfully")
     
-    # Process host sequences
-    host_output = output_dir / "host_embeddings.h5"
-    embedder.process_sequences(
-        host_sequences, 
-        host_output,
-        desc="Embedding host sequences",
-        resume=not args.no_resume
-    )
+    # Generate phage embeddings
+    if not args.skip_phage:
+        print("\n=== Generating Phage Embeddings ===")
+        phage_sequences = load_sequences_from_json(args.phage_sequences)
+        print(f"Loaded {len(phage_sequences)} unique phage sequences")
+        
+        phage_embeddings = embedder.generate_embeddings(phage_sequences)
+        
+        phage_output = os.path.join(args.output_dir, 'phage_embeddings.h5')
+        embedder.save_embeddings(phage_embeddings, phage_output)
+        
+        # Verify
+        if verify_embeddings(phage_output, phage_sequences):
+            print("✓ Phage embeddings verified successfully")
     
-    # Process phage sequences
-    phage_output = output_dir / "phage_embeddings.h5"
-    embedder.process_sequences(
-        phage_sequences,
-        phage_output,
-        desc="Embedding phage sequences",
-        resume=not args.no_resume
-    )
-    
-    print("\nEmbedding generation completed!")
-    print(f"Host embeddings: {host_output}")
-    print(f"Phage embeddings: {phage_output}")
+    print("\n=== Embedding Generation Complete ===")
 
 
 if __name__ == "__main__":

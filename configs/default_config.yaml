@@ -2,7 +2,7 @@
 
 # Data paths
 data:
-  data_path: "data/dedup.phage_marker_rbp_with_phage_entropy.tsv"
+  data_path: "data/dedup.labeled_marker_rbp_phageID_with_hashes.tsv"
   splits_path: "data/processed/splits.pkl"
   embeddings_path: "data/embeddings"
   output_dir: "outputs"

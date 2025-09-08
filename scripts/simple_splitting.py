@@ -1,6 +1,7 @@
 """
-Simple random splitting with RBP deduplication
+Data splitting with RBP deduplication using MD5 hashes
 Ensures val/test don't contain RBPs that were in train
+Works with the new data format that includes host_md5_set and phage_md5_set columns
 """
 
 import pandas as pd
@@ -9,11 +10,13 @@ from collections import defaultdict
 import pickle
 from typing import Tuple, List, Set
 import os
+import argparse
 
-class SimpleDataSplitter:
+
+class DataSplitter:
     """
-    Splits phage-host interaction data randomly, then removes samples
-    from val/test that contain RBPs already seen in training
+    Splits phage-host interaction data with proper RBP deduplication
+    Uses MD5 hashes to track unique proteins
     """
     
     def __init__(self, data_path: str, seed: int = 42):
@@ -21,9 +24,16 @@ class SimpleDataSplitter:
         self.seed = seed
         np.random.seed(seed)
         
-        # Load data
+        # Load data with hash columns
+        print(f"Loading data from {data_path}")
         self.df = pd.read_csv(data_path, sep='\t')
         print(f"Loaded {len(self.df)} interactions")
+        
+        # Check for required columns
+        required_cols = ['host_md5_set', 'phage_md5_set', 'phage_id']
+        missing_cols = [col for col in required_cols if col not in self.df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}")
         
         # Validate data integrity
         self.validate_data()
@@ -32,276 +42,213 @@ class SimpleDataSplitter:
         """Validate data integrity and report any issues"""
         print("\nValidating data integrity...")
         
-        # Check for missing values
-        missing_rbps = self.df['rbp_md5'].isna().sum()
-        missing_markers = self.df['marker_md5'].isna().sum()
+        # Check for missing hash sets
+        missing_host = self.df['host_md5_set'].isna().sum()
+        missing_phage = self.df['phage_md5_set'].isna().sum()
+        empty_host = (self.df['host_md5_set'] == '').sum()
+        empty_phage = (self.df['phage_md5_set'] == '').sum()
         
-        if missing_rbps > 0:
-            print(f"  WARNING: {missing_rbps} rows have missing RBP hashes")
-        if missing_markers > 0:
-            print(f"  WARNING: {missing_markers} rows have missing marker hashes")
+        print(f"  Missing host MD5 sets: {missing_host}")
+        print(f"  Missing phage MD5 sets: {missing_phage}")
+        print(f"  Empty host MD5 sets: {empty_host}")
+        print(f"  Empty phage MD5 sets: {empty_phage}")
         
-        # Check for empty strings
-        empty_rbps = (self.df['rbp_md5'].astype(str) == '').sum()
-        empty_markers = (self.df['marker_md5'].astype(str) == '').sum()
+        # Count multi-protein instances
+        multi_host = (self.df['host_md5_set'].str.count(',') >= 1).sum()
+        multi_phage = (self.df['phage_md5_set'].str.count(',') >= 1).sum()
         
-        if empty_rbps > 0:
-            print(f"  WARNING: {empty_rbps} rows have empty RBP hashes")
-        if empty_markers > 0:
-            print(f"  WARNING: {empty_markers} rows have empty marker hashes")
+        print(f"  Rows with multiple host proteins: {multi_host}")
+        print(f"  Rows with multiple phage proteins: {multi_phage}")
         
-        # Report data statistics
-        print(f"  Total valid samples: {len(self.df) - max(missing_rbps, missing_markers)}")
+        # Get unique protein counts
+        all_host_hashes = set()
+        all_phage_hashes = set()
         
-    def parse_rbps(self, indices: List[int]) -> Set[str]:
-        """Extract all unique RBP hashes from given sample indices"""
-        rbp_hashes = set()
-        for idx in indices:
-            row = self.df.iloc[idx]
-            rbp_field = str(row['rbp_md5'])
+        for idx, row in self.df.iterrows():
+            host_hashes = str(row['host_md5_set']).split(',') if pd.notna(row['host_md5_set']) else []
+            phage_hashes = str(row['phage_md5_set']).split(',') if pd.notna(row['phage_md5_set']) else []
             
-            # Skip if NaN or empty
-            if pd.isna(row['rbp_md5']) or rbp_field == 'nan' or not rbp_field:
-                continue
-                
-            # Handle both single and multiple RBPs
-            if ',' in rbp_field:
-                rbps = [rbp.strip() for rbp in rbp_field.split(',') if rbp.strip()]
-                rbp_hashes.update(rbps)
-            else:
-                rbp_field = rbp_field.strip()
-                if rbp_field:
-                    rbp_hashes.add(rbp_field)
-        return rbp_hashes
+            all_host_hashes.update([h for h in host_hashes if h and h != 'nan'])
+            all_phage_hashes.update([h for h in phage_hashes if h and h != 'nan'])
+        
+        print(f"  Total unique host proteins: {len(all_host_hashes)}")
+        print(f"  Total unique phage proteins: {len(all_phage_hashes)}")
     
-    def parse_markers(self, indices: List[int]) -> Set[str]:
-        """Extract all unique marker hashes from given sample indices"""
-        marker_hashes = set()
-        for idx in indices:
-            row = self.df.iloc[idx]
-            marker_field = str(row['marker_md5'])
+    def get_rbp_hashes(self, row) -> Set[str]:
+        """Extract RBP MD5 hashes from a row"""
+        phage_field = str(row['phage_md5_set'])
+        
+        if pd.isna(row['phage_md5_set']) or phage_field == 'nan' or not phage_field:
+            return set()
+        
+        # Split by comma and clean
+        hashes = [h.strip() for h in phage_field.split(',')]
+        return set(h for h in hashes if h and h != 'nan')
+    
+    def split_data(self, train_ratio: float = 0.6, val_ratio: float = 0.2) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Split data into train/val/test with RBP deduplication
+        
+        Args:
+            train_ratio: Proportion of data for training
+            val_ratio: Proportion of data for validation
             
-            # Skip if NaN or empty
-            if pd.isna(row['marker_md5']) or marker_field == 'nan' or not marker_field:
-                continue
-                
-            # Handle both single and multiple markers
-            if ',' in marker_field:
-                markers = [m.strip() for m in marker_field.split(',') if m.strip()]
-                marker_hashes.update(markers)
-            else:
-                marker_field = marker_field.strip()
-                if marker_field:
-                    marker_hashes.add(marker_field)
-        return marker_hashes
-    
-    def has_rbp_overlap(self, sample_idx: int, train_rbps: Set[str]) -> bool:
-        """Check if a sample contains any RBPs that are in the training set"""
-        row = self.df.iloc[sample_idx]
-        rbp_field = str(row['rbp_md5'])
-        
-        # Return False if NaN or empty
-        if pd.isna(row['rbp_md5']) or rbp_field == 'nan' or not rbp_field:
-            return False
-        
-        # Parse RBPs with proper cleaning
-        if ',' in rbp_field:
-            sample_rbps = [rbp.strip() for rbp in rbp_field.split(',') if rbp.strip()]
-        else:
-            rbp_field = rbp_field.strip()
-            sample_rbps = [rbp_field] if rbp_field else []
-        
-        # Check for overlap
-        return any(rbp in train_rbps for rbp in sample_rbps)
-    
-    def split_data(self, train_ratio: float = 0.6, val_ratio: float = 0.2) -> Tuple[List[int], List[int], List[int]]:
+        Returns:
+            Tuple of (train_df, val_df, test_df)
         """
-        Create train/val/test splits ensuring no RBP overlap
-        """
-        print(f"\nCreating splits (train={train_ratio}, val={val_ratio}, test={1-train_ratio-val_ratio})...")
+        print("\n=== Splitting Data ===")
         
-        # Initial random split
-        n_samples = len(self.df)
-        indices = np.arange(n_samples)
-        np.random.shuffle(indices)
+        # Shuffle data
+        shuffled_df = self.df.sample(frac=1, random_state=self.seed).reset_index(drop=True)
         
         # Calculate split points
-        n_train = int(n_samples * train_ratio)
-        n_val = int(n_samples * val_ratio)
+        n_total = len(shuffled_df)
+        n_train = int(n_total * train_ratio)
+        n_val = int(n_total * val_ratio)
         
-        # Initial splits
-        train_idx = indices[:n_train].tolist()
-        val_idx = indices[n_train:n_train + n_val].tolist()
-        test_idx = indices[n_train + n_val:].tolist()
+        # Initial random split
+        train_df = shuffled_df.iloc[:n_train].copy()
+        val_df = shuffled_df.iloc[n_train:n_train + n_val].copy()
+        test_df = shuffled_df.iloc[n_train + n_val:].copy()
         
-        print(f"Initial split sizes - Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+        print(f"\nInitial split:")
+        print(f"  Train: {len(train_df)} samples")
+        print(f"  Val: {len(val_df)} samples")
+        print(f"  Test: {len(test_df)} samples")
         
-        # Get all RBPs in training set
-        train_rbps = self.parse_rbps(train_idx)
-        print(f"Training set contains {len(train_rbps)} unique RBPs")
+        # Get all RBP hashes from training set
+        train_rbp_hashes = set()
+        for idx, row in train_df.iterrows():
+            train_rbp_hashes.update(self.get_rbp_hashes(row))
         
-        # Remove samples from val that contain training RBPs
-        val_clean = []
-        val_removed = []
-        for idx in val_idx:
-            if self.has_rbp_overlap(idx, train_rbps):
-                val_removed.append(idx)
+        print(f"\nUnique RBPs in training: {len(train_rbp_hashes)}")
+        
+        # Remove validation samples with RBPs seen in training
+        val_mask = []
+        val_removed = 0
+        for idx, row in val_df.iterrows():
+            rbp_hashes = self.get_rbp_hashes(row)
+            if rbp_hashes and rbp_hashes.intersection(train_rbp_hashes):
+                val_mask.append(False)
+                val_removed += 1
             else:
-                val_clean.append(idx)
+                val_mask.append(True)
         
-        # Remove samples from test that contain training RBPs
-        test_clean = []
-        test_removed = []
-        for idx in test_idx:
-            if self.has_rbp_overlap(idx, train_rbps):
-                test_removed.append(idx)
+        val_df = val_df[val_mask].reset_index(drop=True)
+        print(f"Removed {val_removed} validation samples with training RBPs")
+        
+        # Remove test samples with RBPs seen in training
+        test_mask = []
+        test_removed = 0
+        for idx, row in test_df.iterrows():
+            rbp_hashes = self.get_rbp_hashes(row)
+            if rbp_hashes and rbp_hashes.intersection(train_rbp_hashes):
+                test_mask.append(False)
+                test_removed += 1
             else:
-                test_clean.append(idx)
+                test_mask.append(True)
         
-        print(f"\nRemoved {len(val_removed)} samples from validation (had training RBPs)")
-        print(f"Removed {len(test_removed)} samples from test (had training RBPs)")
+        test_df = test_df[test_mask].reset_index(drop=True)
+        print(f"Removed {test_removed} test samples with training RBPs")
         
-        # Update splits
-        val_idx = val_clean
-        test_idx = test_clean
+        # Final statistics
+        print(f"\n=== Final Split ===")
+        print(f"Train: {len(train_df)} samples ({len(train_df)/n_total:.1%})")
+        print(f"Val: {len(val_df)} samples ({len(val_df)/n_total:.1%})")
+        print(f"Test: {len(test_df)} samples ({len(test_df)/n_total:.1%})")
+        print(f"Total retained: {len(train_df) + len(val_df) + len(test_df)} / {n_total}")
         
-        print(f"\nFinal split sizes - Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
-        total_used = len(train_idx) + len(val_idx) + len(test_idx)
-        print(f"Total samples used: {total_used}/{n_samples} ({total_used/n_samples:.1%})")
+        # Verify no RBP overlap
+        val_rbps = set()
+        for idx, row in val_df.iterrows():
+            val_rbps.update(self.get_rbp_hashes(row))
         
-        return train_idx, val_idx, test_idx
+        test_rbps = set()
+        for idx, row in test_df.iterrows():
+            test_rbps.update(self.get_rbp_hashes(row))
+        
+        val_overlap = val_rbps.intersection(train_rbp_hashes)
+        test_overlap = test_rbps.intersection(train_rbp_hashes)
+        
+        if val_overlap:
+            print(f"WARNING: {len(val_overlap)} RBPs still overlap between train and val!")
+        if test_overlap:
+            print(f"WARNING: {len(test_overlap)} RBPs still overlap between train and test!")
+        
+        if not val_overlap and not test_overlap:
+            print("\n✓ Successfully verified: No RBP overlap between train and val/test")
+        
+        return train_df, val_df, test_df
     
-    def verify_splits(self, train_idx: List[int], val_idx: List[int], test_idx: List[int]):
-        """
-        Verify the quality of splits and check for any remaining overlap
-        """
-        print("\n" + "="*50)
-        print("VERIFICATION REPORT")
-        print("="*50)
-        
-        # Get proteins in each split
-        train_markers = self.parse_markers(train_idx)
-        train_rbps = self.parse_rbps(train_idx)
-        
-        val_markers = self.parse_markers(val_idx)
-        val_rbps = self.parse_rbps(val_idx)
-        
-        test_markers = self.parse_markers(test_idx)
-        test_rbps = self.parse_rbps(test_idx)
-        
-        # Check RBP overlaps (should be zero for val/test with train)
-        rbp_train_val = train_rbps & val_rbps
-        rbp_train_test = train_rbps & test_rbps
-        rbp_val_test = val_rbps & test_rbps
-        
-        print(f"\nRBP overlaps:")
-        print(f"  Train-Val: {len(rbp_train_val)} shared RBPs")
-        print(f"  Train-Test: {len(rbp_train_test)} shared RBPs")
-        print(f"  Val-Test: {len(rbp_val_test)} shared RBPs")
-        
-        if len(rbp_train_val) > 0 or len(rbp_train_test) > 0:
-            print("  ⚠️ WARNING: RBPs leaked from training set!")
-        else:
-            print("  ✅ No RBP leakage from training set")
-        
-        # Check marker overlaps (these are allowed but good to know)
-        marker_train_val = train_markers & val_markers
-        marker_train_test = train_markers & test_markers
-        marker_val_test = val_markers & test_markers
-        
-        print(f"\nMarker overlaps (allowed):")
-        print(f"  Train-Val: {len(marker_train_val)} shared markers")
-        print(f"  Train-Test: {len(marker_train_test)} shared markers")
-        print(f"  Val-Test: {len(marker_val_test)} shared markers")
-        
-        # Coverage statistics
-        total_unique_markers = len(train_markers | val_markers | test_markers)
-        total_unique_rbps = len(train_rbps | val_rbps | test_rbps)
-        
-        print(f"\nProtein coverage:")
-        print(f"  Train: {len(train_markers)} markers ({len(train_markers)/total_unique_markers:.1%}), "
-              f"{len(train_rbps)} RBPs ({len(train_rbps)/total_unique_rbps:.1%})")
-        print(f"  Val: {len(val_markers)} markers ({len(val_markers)/total_unique_markers:.1%}), "
-              f"{len(val_rbps)} RBPs ({len(val_rbps)/total_unique_rbps:.1%})")
-        print(f"  Test: {len(test_markers)} markers ({len(test_markers)/total_unique_markers:.1%}), "
-              f"{len(test_rbps)} RBPs ({len(test_rbps)/total_unique_rbps:.1%})")
-        
-        # Distribution of multi-instance samples
-        print(f"\nMulti-instance distribution:")
-        for split_name, split_idx in [("Train", train_idx), ("Val", val_idx), ("Test", test_idx)]:
-            multi_marker = 0
-            multi_rbp = 0
-            for idx in split_idx:
-                row = self.df.iloc[idx]
-                if ',' in str(row['marker_md5']):
-                    multi_marker += 1
-                if ',' in str(row['rbp_md5']):
-                    multi_rbp += 1
-            print(f"  {split_name}: {multi_marker} samples with multiple markers, "
-                  f"{multi_rbp} samples with multiple RBPs")
-        
-        return len(rbp_train_val) == 0 and len(rbp_train_test) == 0
-    
-    def save_splits(self, train_idx: List[int], val_idx: List[int], test_idx: List[int], 
-                    output_dir: str = 'data/processed'):
-        """Save the split indices and data"""
+    def save_splits(self, train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame, output_dir: str):
+        """Save the splits to files"""
         os.makedirs(output_dir, exist_ok=True)
         
-        # Save indices
+        # Save as TSV files
+        train_path = os.path.join(output_dir, 'train.tsv')
+        val_path = os.path.join(output_dir, 'val.tsv')
+        test_path = os.path.join(output_dir, 'test.tsv')
+        
+        train_df.to_csv(train_path, sep='\t', index=False)
+        val_df.to_csv(val_path, sep='\t', index=False)
+        test_df.to_csv(test_path, sep='\t', index=False)
+        
+        print(f"\nSaved splits to {output_dir}/")
+        print(f"  train.tsv: {len(train_df)} samples")
+        print(f"  val.tsv: {len(val_df)} samples")
+        print(f"  test.tsv: {len(test_df)} samples")
+        
+        # Save as pickle for easy loading
         splits = {
-            'train_idx': train_idx,
-            'val_idx': val_idx,
-            'test_idx': test_idx,
-            'method': 'simple_random_with_rbp_dedup',
-            'seed': self.seed
+            'train': train_df,
+            'val': val_df,
+            'test': test_df
         }
         
-        with open(f'{output_dir}/splits.pkl', 'wb') as f:
+        pickle_path = os.path.join(output_dir, 'splits.pkl')
+        with open(pickle_path, 'wb') as f:
             pickle.dump(splits, f)
+        print(f"  splits.pkl: Combined pickle file")
         
-        # Save actual data splits
-        train_df = self.df.iloc[train_idx].copy()
-        val_df = self.df.iloc[val_idx].copy()
-        test_df = self.df.iloc[test_idx].copy()
+        # Save statistics
+        stats_path = os.path.join(output_dir, 'split_stats.txt')
+        with open(stats_path, 'w') as f:
+            f.write(f"Train: {len(train_df)} samples\n")
+            f.write(f"Val: {len(val_df)} samples\n")
+            f.write(f"Test: {len(test_df)} samples\n")
+            f.write(f"Total: {len(train_df) + len(val_df) + len(test_df)} samples\n")
         
-        train_df.to_csv(f'{output_dir}/train.tsv', sep='\t', index=False)
-        val_df.to_csv(f'{output_dir}/val.tsv', sep='\t', index=False)
-        test_df.to_csv(f'{output_dir}/test.tsv', sep='\t', index=False)
-        
-        # Save split statistics
-        stats = {
-            'train_size': len(train_idx),
-            'val_size': len(val_idx),
-            'test_size': len(test_idx),
-            'total_samples': len(self.df),
-            'samples_used': len(train_idx) + len(val_idx) + len(test_idx)
-        }
-        
-        with open(f'{output_dir}/split_stats.txt', 'w') as f:
-            for key, value in stats.items():
-                f.write(f"{key}: {value}\n")
-        
-        print(f"\nSplits saved to {output_dir}/")
+        print(f"  split_stats.txt: Statistics file")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Split data with RBP deduplication')
+    parser.add_argument('--data_path', type=str,
+                       default='data/dedup.labeled_marker_rbp_phageID_with_hashes.tsv',
+                       help='Path to data file with hash columns')
+    parser.add_argument('--output_dir', type=str,
+                       default='data/processed',
+                       help='Directory to save splits')
+    parser.add_argument('--train_ratio', type=float, default=0.6,
+                       help='Proportion of data for training')
+    parser.add_argument('--val_ratio', type=float, default=0.2,
+                       help='Proportion of data for validation')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed')
     
-    def run(self):
-        """Execute the splitting pipeline"""
-        # Create splits
-        train_idx, val_idx, test_idx = self.split_data()
-        
-        # Verify splits
-        is_valid = self.verify_splits(train_idx, val_idx, test_idx)
-        
-        if is_valid:
-            # Save splits
-            self.save_splits(train_idx, val_idx, test_idx)
-            print("\n✅ Splitting completed successfully!")
-        else:
-            print("\n⚠️ Warning: Splits have RBP leakage but were saved anyway")
-            self.save_splits(train_idx, val_idx, test_idx)
-        
-        return train_idx, val_idx, test_idx
+    args = parser.parse_args()
+    
+    # Create splitter
+    splitter = DataSplitter(args.data_path, args.seed)
+    
+    # Split data
+    train_df, val_df, test_df = splitter.split_data(args.train_ratio, args.val_ratio)
+    
+    # Save splits
+    splitter.save_splits(train_df, val_df, test_df, args.output_dir)
+    
+    print("\n=== Splitting Complete ===")
 
 
 if __name__ == "__main__":
-    splitter = SimpleDataSplitter('data/dedup.phage_marker_rbp_with_phage_entropy.tsv')
-    train_idx, val_idx, test_idx = splitter.run()
+    main()

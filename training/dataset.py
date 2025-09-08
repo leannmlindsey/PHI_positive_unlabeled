@@ -1,5 +1,5 @@
 """
-PyTorch Dataset classes for phage-host interaction data
+PyTorch Dataset classes for phage-host interaction data using MD5 hash-based loading
 """
 
 import torch
@@ -12,20 +12,20 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any
 import h5py
 
-from utils.data_utils import EmbeddingLoader, MultiInstanceBag, DataProcessor
+from utils.data_utils import HashBasedEmbeddingLoader, MultiInstanceBag, DataProcessor
 
 
 class PhageHostDataset(Dataset):
     """
     PyTorch Dataset for phage-host interaction data
-    Handles multi-instance bags with variable numbers of proteins
+    Uses MD5 hashes to load embeddings for multi-instance bags
     """
     
     def __init__(self,
                  bags: List[MultiInstanceBag],
-                 embedding_loader: EmbeddingLoader,
-                 max_markers: int = 2,
-                 max_rbps: int = 20,
+                 embedding_loader: HashBasedEmbeddingLoader,
+                 max_hosts: int = 2,
+                 max_phages: int = 20,
                  augment: bool = False,
                  logger: Optional[logging.Logger] = None):
         """
@@ -33,16 +33,16 @@ class PhageHostDataset(Dataset):
         
         Args:
             bags: List of MultiInstanceBag objects
-            embedding_loader: EmbeddingLoader instance
-            max_markers: Maximum number of markers (for padding)
-            max_rbps: Maximum number of RBPs (for padding)
+            embedding_loader: HashBasedEmbeddingLoader instance
+            max_hosts: Maximum number of host proteins (for padding)
+            max_phages: Maximum number of phage proteins (for padding)
             augment: Whether to apply data augmentation
             logger: Optional logger
         """
         self.bags = bags
         self.embedding_loader = embedding_loader
-        self.max_markers = max_markers
-        self.max_rbps = max_rbps
+        self.max_hosts = max_hosts
+        self.max_phages = max_phages
         self.augment = augment
         self.logger = logger or logging.getLogger(__name__)
         
@@ -57,17 +57,17 @@ class PhageHostDataset(Dataset):
         n_positive = sum(1 for bag in self.bags if bag.label == 1)
         n_negative = len(self.bags) - n_positive
         
-        marker_counts = [len(bag.marker_hashes) for bag in self.bags]
-        rbp_counts = [len(bag.rbp_hashes) for bag in self.bags]
+        host_counts = [len(bag.host_hashes) for bag in self.bags]
+        phage_counts = [len(bag.phage_hashes) for bag in self.bags]
         
         self.logger.info(f"Dataset statistics:")
         self.logger.info(f"  Total samples: {len(self.bags)}")
         self.logger.info(f"  Positive: {n_positive} ({n_positive/len(self.bags):.1%})")
         self.logger.info(f"  Negative: {n_negative} ({n_negative/len(self.bags):.1%})")
-        self.logger.info(f"  Markers per bag: min={min(marker_counts)}, "
-                        f"max={max(marker_counts)}, avg={np.mean(marker_counts):.1f}")
-        self.logger.info(f"  RBPs per bag: min={min(rbp_counts)}, "
-                        f"max={max(rbp_counts)}, avg={np.mean(rbp_counts):.1f}")
+        self.logger.info(f"  Host proteins per bag: min={min(host_counts)}, "
+                        f"max={max(host_counts)}, avg={np.mean(host_counts):.1f}")
+        self.logger.info(f"  Phage proteins per bag: min={min(phage_counts)}, "
+                        f"max={max(phage_counts)}, avg={np.mean(phage_counts):.1f}")
         
     def __len__(self) -> int:
         """Get dataset size"""
@@ -82,244 +82,218 @@ class PhageHostDataset(Dataset):
             
         Returns:
             Dictionary containing:
-            - marker_embeddings: Padded marker embeddings (max_markers, embedding_dim)
-            - rbp_embeddings: Padded RBP embeddings (max_rbps, embedding_dim)
-            - marker_mask: Binary mask for markers (max_markers,)
-            - rbp_mask: Binary mask for RBPs (max_rbps,)
+            - host_embeddings: Padded host embeddings (max_hosts, embedding_dim)
+            - phage_embeddings: Padded phage embeddings (max_phages, embedding_dim)
+            - host_mask: Binary mask for hosts (max_hosts,)
+            - phage_mask: Binary mask for phages (max_phages,)
             - label: Binary label (scalar)
         """
         bag = self.bags[idx]
         
-        # Get embeddings with error handling
+        # Get embeddings using the new method
         try:
-            marker_embeddings, rbp_embeddings = bag.get_embeddings(self.embedding_loader, use_zero_for_missing=True)
-        except ValueError as e:
-            # Log error and return a sample with zero embeddings (will be masked out)
-            if hasattr(self, 'logger') and self.logger:
+            host_embeddings, phage_embeddings, host_mask, phage_mask = bag.get_embeddings(
+                self.embedding_loader,
+                max_host=self.max_hosts,
+                max_phage=self.max_phages
+            )
+        except Exception as e:
+            # Log error and return a zero sample
+            if self.logger:
                 self.logger.error(f"Failed to get embeddings for index {idx}: {e}")
-            # Return minimal valid sample that will be ignored due to masks
             return {
-                'marker_embeddings': torch.zeros((self.max_markers, self.embedding_dim)),
-                'rbp_embeddings': torch.zeros((self.max_rbps, self.embedding_dim)),
-                'marker_mask': torch.zeros(self.max_markers),
-                'rbp_mask': torch.zeros(self.max_rbps),
+                'host_embeddings': torch.zeros((self.max_hosts, self.embedding_dim)),
+                'phage_embeddings': torch.zeros((self.max_phages, self.embedding_dim)),
+                'host_mask': torch.zeros(self.max_hosts),
+                'phage_mask': torch.zeros(self.max_phages),
                 'label': torch.tensor(0.0, dtype=torch.float32)
             }
-        
-        # Get actual counts
-        n_markers = len(bag.marker_hashes)
-        n_rbps = len(bag.rbp_hashes)
-        
-        # Initialize padded tensors
-        padded_markers = np.zeros((self.max_markers, self.embedding_dim), dtype=np.float32)
-        padded_rbps = np.zeros((self.max_rbps, self.embedding_dim), dtype=np.float32)
-        marker_mask = np.zeros(self.max_markers, dtype=np.float32)
-        rbp_mask = np.zeros(self.max_rbps, dtype=np.float32)
-        
-        # Fill with actual data
-        padded_markers[:n_markers] = marker_embeddings
-        padded_rbps[:n_rbps] = rbp_embeddings
-        marker_mask[:n_markers] = 1.0
-        rbp_mask[:n_rbps] = 1.0
         
         # Apply augmentation if enabled
         if self.augment and bag.label == 1:  # Only augment positive samples
             # Random dropout of proteins (simulate missing proteins)
             if np.random.random() < 0.1:  # 10% chance
-                if n_markers > 1 and np.random.random() < 0.5:
-                    # Drop one marker
-                    drop_idx = np.random.randint(n_markers)
-                    marker_mask[drop_idx] = 0.0
+                n_hosts = np.sum(host_mask > 0)
+                n_phages = np.sum(phage_mask > 0)
+                
+                if n_hosts > 1 and np.random.random() < 0.5:
+                    # Drop one host protein
+                    drop_idx = np.random.randint(n_hosts)
+                    host_mask[drop_idx] = 0.0
                     
-                if n_rbps > 1 and np.random.random() < 0.5:
-                    # Drop one RBP
-                    drop_idx = np.random.randint(n_rbps)
-                    rbp_mask[drop_idx] = 0.0
+                if n_phages > 1 and np.random.random() < 0.5:
+                    # Drop one phage protein
+                    drop_idx = np.random.randint(n_phages)
+                    phage_mask[drop_idx] = 0.0
                     
             # Add small noise to embeddings
             if np.random.random() < 0.2:  # 20% chance
                 noise_scale = 0.01
-                padded_markers += np.random.randn(*padded_markers.shape).astype(np.float32) * noise_scale
-                padded_rbps += np.random.randn(*padded_rbps.shape).astype(np.float32) * noise_scale
+                host_embeddings = host_embeddings + np.random.randn(*host_embeddings.shape).astype(np.float32) * noise_scale
+                phage_embeddings = phage_embeddings + np.random.randn(*phage_embeddings.shape).astype(np.float32) * noise_scale
         
         # Convert to tensors
         return {
-            'marker_embeddings': torch.from_numpy(padded_markers),
-            'rbp_embeddings': torch.from_numpy(padded_rbps),
-            'marker_mask': torch.from_numpy(marker_mask),
-            'rbp_mask': torch.from_numpy(rbp_mask),
+            'host_embeddings': torch.from_numpy(host_embeddings.astype(np.float32)),
+            'phage_embeddings': torch.from_numpy(phage_embeddings.astype(np.float32)),
+            'host_mask': torch.from_numpy(host_mask.astype(np.float32)),
+            'phage_mask': torch.from_numpy(phage_mask.astype(np.float32)),
             'label': torch.tensor(bag.label, dtype=torch.float32)
         }
 
 
 class PhageHostDataModule:
     """
-    Data module that manages all data loading for training
+    Data module for managing train/val/test datasets
     """
     
     def __init__(self,
                  data_path: str,
                  splits_path: str,
-                 embeddings_path: str,
+                 embeddings_dir: str,
                  batch_size: int = 32,
-                 negative_ratio: float = 1.0,
-                 max_markers: int = 2,
-                 max_rbps: int = 20,
+                 max_hosts: int = 2,
+                 max_phages: int = 20,
+                 negative_ratio_train: float = 1.0,
+                 negative_ratio_val: float = 4.0,
+                 negative_ratio_test: float = 49.0,
                  num_workers: int = 4,
                  pin_memory: bool = True,
                  augment_train: bool = True,
-                 seed: int = 42,
-                 lazy_loading: bool = True,
                  cache_size: int = 10000,
+                 preload_all: bool = False,
                  logger: Optional[logging.Logger] = None):
         """
         Initialize the data module
         
         Args:
-            data_path: Path to original TSV data
+            data_path: Path to data file with hash columns
             splits_path: Path to splits pickle file
-            embeddings_path: Path to HDF5 embeddings file
+            embeddings_dir: Directory containing embedding files
             batch_size: Batch size for data loaders
-            negative_ratio: Ratio of negative to positive samples
-            max_markers: Maximum number of markers
-            max_rbps: Maximum number of RBPs
+            max_hosts: Maximum number of host proteins
+            max_phages: Maximum number of phage proteins
+            negative_ratio_train: Negative to positive ratio for training
+            negative_ratio_val: Negative to positive ratio for validation
+            negative_ratio_test: Negative to positive ratio for testing
             num_workers: Number of data loader workers
-            pin_memory: Whether to pin memory for GPU
+            pin_memory: Whether to pin memory for GPU transfer
             augment_train: Whether to augment training data
-            seed: Random seed
-            lazy_loading: Whether to use lazy loading for embeddings
-            cache_size: Size of LRU cache for lazy loading
+            cache_size: Size of embedding cache
+            preload_all: Whether to preload all embeddings
             logger: Optional logger
         """
+        self.data_path = Path(data_path)
+        self.splits_path = Path(splits_path)
+        self.embeddings_dir = Path(embeddings_dir)
         self.batch_size = batch_size
-        self.negative_ratio = negative_ratio
-        self.max_markers = max_markers
-        self.max_rbps = max_rbps
+        self.max_hosts = max_hosts
+        self.max_phages = max_phages
+        self.negative_ratios = {
+            'train': negative_ratio_train,
+            'val': negative_ratio_val,
+            'test': negative_ratio_test
+        }
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.augment_train = augment_train
-        self.seed = seed
-        self.lazy_loading = lazy_loading
-        self.cache_size = cache_size
         self.logger = logger or logging.getLogger(__name__)
         
-        # Load embeddings - check if we have separate host/phage files
-        embeddings_dir = Path(embeddings_path)
-        host_embeddings_file = embeddings_dir / 'host_embeddings.h5'
-        phage_embeddings_file = embeddings_dir / 'phage_embeddings.h5'
-        
-        if host_embeddings_file.exists() and phage_embeddings_file.exists():
-            # Use dual embedding loader for separate files
-            self.logger.info(f"Loading separate host and phage embeddings from {embeddings_path}")
-            from utils.dual_embedding_loader import DualEmbeddingLoader
-            self.embedding_loader = DualEmbeddingLoader(
-                host_embeddings_path=str(host_embeddings_file),
-                phage_embeddings_path=str(phage_embeddings_file),
-                cache_size=cache_size,
-                preload_all=not lazy_loading,
-                logger=self.logger
-            )
-        else:
-            # Fall back to single file loader (legacy)
-            self.logger.info(f"Loading embeddings from {embeddings_path} (lazy={lazy_loading})")
-            if lazy_loading:
-                from utils.data_utils import LazyEmbeddingLoader
-                self.embedding_loader = LazyEmbeddingLoader(
-                    embeddings_path, 
-                    cache_size=cache_size,
-                    logger=self.logger
-                )
-            else:
-                self.embedding_loader = EmbeddingLoader(embeddings_path, self.logger)
-        
-        # Load data processor
-        self.logger.info(f"Loading data from {data_path}")
-        self.data_processor = DataProcessor(
-            data_path=data_path,
-            split_path=splits_path,
-            embedding_loader=self.embedding_loader,
+        # Initialize embedding loader
+        self.embedding_loader = HashBasedEmbeddingLoader(
+            host_embedding_path=str(self.embeddings_dir / 'host_embeddings.h5'),
+            phage_embedding_path=str(self.embeddings_dir / 'phage_embeddings.h5'),
+            cache_size=cache_size,
+            preload_all=preload_all,
             logger=self.logger
         )
         
-        # Prepare datasets
+        # Initialize data processor
+        self.data_processor = DataProcessor(logger=self.logger)
+        
+        # Load and prepare datasets
         self._prepare_datasets()
-    
-    def get_cache_stats(self) -> Dict[str, Any]:
-        """Get embedding cache statistics if using lazy loading"""
-        if self.lazy_loading and hasattr(self.embedding_loader, 'cache_stats'):
-            return self.embedding_loader.cache_stats()
-        return {}
         
     def _prepare_datasets(self):
         """Prepare train, validation, and test datasets"""
-        # Get positive bags for each split
-        train_positive = self.data_processor.get_split_data('train')
-        val_positive = self.data_processor.get_split_data('val')
-        test_positive = self.data_processor.get_split_data('test')
+        # Load splits
+        if self.splits_path.exists():
+            self.logger.info(f"Loading splits from {self.splits_path}")
+            with open(self.splits_path, 'rb') as f:
+                splits = pickle.load(f)
+            
+            train_df = splits['train']
+            val_df = splits['val']
+            test_df = splits['test']
+        else:
+            # Load full data and create default split
+            self.logger.warning(f"Splits file not found at {self.splits_path}")
+            self.logger.info("Creating default 60-20-20 split")
+            
+            df = self.data_processor.load_data_with_hashes(str(self.data_path))
+            
+            # Shuffle and split
+            df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+            n_total = len(df)
+            n_train = int(n_total * 0.6)
+            n_val = int(n_total * 0.2)
+            
+            train_df = df.iloc[:n_train]
+            val_df = df.iloc[n_train:n_train+n_val]
+            test_df = df.iloc[n_train+n_val:]
         
-        # Generate negative samples for training
-        train_negative = self.data_processor.generate_negative_samples(
-            train_positive,
-            negative_ratio=self.negative_ratio,
-            seed=self.seed
+        # Create bags for each split
+        self.train_bags = self.data_processor.create_bags_from_dataframe(
+            train_df, 
+            negative_ratio=self.negative_ratios['train'],
+            seed=42
         )
         
-        # Generate negative samples for validation - keep balanced for proper learning signal
-        val_neg_ratio = 1.0  # 1:1 for balanced validation (50% positive rate)
-        val_negative = self.data_processor.generate_negative_samples(
-            val_positive,
-            negative_ratio=val_neg_ratio,
-            seed=self.seed + 1
+        self.val_bags = self.data_processor.create_bags_from_dataframe(
+            val_df,
+            negative_ratio=self.negative_ratios['val'],
+            seed=43
         )
         
-        # Generate negative samples for test (use test_negative_ratio if specified)
-        test_neg_ratio = 49.0  # 49:1 negative:positive for ~2% positive rate
-        test_negative = self.data_processor.generate_negative_samples(
-            test_positive,
-            negative_ratio=test_neg_ratio,
-            seed=self.seed + 2
+        self.test_bags = self.data_processor.create_bags_from_dataframe(
+            test_df,
+            negative_ratio=self.negative_ratios['test'],
+            seed=44
         )
         
-        # Combine positive and negative
-        train_bags = train_positive + train_negative
-        val_bags = val_positive + val_negative
-        test_bags = test_positive + test_negative
-        
-        # Shuffle training data
-        np.random.seed(self.seed)
-        np.random.shuffle(train_bags)
+        self.logger.info(f"Dataset sizes:")
+        self.logger.info(f"  Train: {len(self.train_bags)} bags")
+        self.logger.info(f"  Val: {len(self.val_bags)} bags")
+        self.logger.info(f"  Test: {len(self.test_bags)} bags")
         
         # Create datasets
         self.train_dataset = PhageHostDataset(
-            bags=train_bags,
+            bags=self.train_bags,
             embedding_loader=self.embedding_loader,
-            max_markers=self.max_markers,
-            max_rbps=self.max_rbps,
+            max_hosts=self.max_hosts,
+            max_phages=self.max_phages,
             augment=self.augment_train,
             logger=self.logger
         )
         
         self.val_dataset = PhageHostDataset(
-            bags=val_bags,
+            bags=self.val_bags,
             embedding_loader=self.embedding_loader,
-            max_markers=self.max_markers,
-            max_rbps=self.max_rbps,
+            max_hosts=self.max_hosts,
+            max_phages=self.max_phages,
             augment=False,
             logger=self.logger
         )
         
         self.test_dataset = PhageHostDataset(
-            bags=test_bags,
+            bags=self.test_bags,
             embedding_loader=self.embedding_loader,
-            max_markers=self.max_markers,
-            max_rbps=self.max_rbps,
+            max_hosts=self.max_hosts,
+            max_phages=self.max_phages,
             augment=False,
             logger=self.logger
         )
-        
-        self.logger.info(f"Dataset sizes - Train: {len(self.train_dataset)}, "
-                        f"Val: {len(self.val_dataset)}, Test: {len(self.test_dataset)}")
-        
+    
     def train_dataloader(self) -> DataLoader:
         """Get training data loader"""
         return DataLoader(
@@ -328,7 +302,7 @@ class PhageHostDataModule:
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            drop_last=True  # Drop last incomplete batch for stable training
+            drop_last=True
         )
     
     def val_dataloader(self) -> DataLoader:

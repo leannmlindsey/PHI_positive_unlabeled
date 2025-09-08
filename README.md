@@ -55,26 +55,44 @@ phi_pos_unlabeled/
 
 ## Input Data Description
 
-### Main Data File: `dedup.phage_marker_rbp_with_phage_entropy.tsv`
+### Main Data File: `dedup.labeled_marker_rbp_phageID.tsv`
 
-Tab-separated file with 24,794 known positive interactions containing:
+Tab-separated file with 25,470 known positive interactions containing:
 
 | Column | Description | Format |
 |--------|-------------|--------|
-| `marker_gene_seq` | Host marker protein sequences | Comma-separated if multiple |
-| `rbp_seq` | Phage RBP sequences | Comma-separated if multiple |
-| `phage_id` | Unique phage identifier | String |
-| `rbp_length` | Length of RBP sequence | Integer |
-| `marker_md5` | MD5 hash of marker sequences | Comma-separated if multiple |
-| `rbp_md5` | MD5 hash of RBP sequences | Comma-separated if multiple |
-| `shannon_entropy` | Sequence entropy measure | Float |
-| `n_unique_markers` | Number of unique markers | Integer |
+| `wzx_gene_seq` | Host wzx (flippase) protein sequences | Protein sequence string |
+| `wzm_gene_seq` | Host wzm protein sequences | Protein sequence string |
+| `rbp_seq` | Phage RBP sequences | Protein sequence string |
+| `phage_ids` | Unique phage identifier | String (e.g., GCA_022150005.1_41) |
+
+Note: This file does not have a header row. All entries represent positive interactions (prophages found in host genomes).
+
+### Alternative Data File (if available): `all_info.labeled_marker.tsv`
+
+More detailed file with additional metadata:
+
+| Column | Description | Format |
+|--------|-------------|--------|
+| `genome_id` | Host genome identifier | String |
+| `wzx_gene_id` | Wzx gene identifier | String |
+| `wzx_gene_seq` | Host wzx protein sequence | Protein sequence string |
+| `wzm_gene_id` | Wzm gene identifier | String |
+| `wzm_gene_seq` | Host wzm protein sequence | Protein sequence string |
+| `phage_id` | Phage identifier | String |
+| `rbp_id` | RBP identifier | String |
+| `rbp_seq` | Phage RBP sequence | Protein sequence string |
 
 ### Data Characteristics
 - **All interactions are positive** (prophages found in host genomes)
 - **Multi-instance nature**: 
-  - Hosts have 1-2 marker proteins
-  - Phages have 1-18 RBPs (typically 1-4)
+  - Hosts have 1-2 marker proteins (wzx and/or wzm) - in this dataset all have both
+  - Phages have 1-18 RBPs per interaction:
+    - 18,888 rows (74.2%) have 1 RBP
+    - 5,394 rows (21.2%) have 2 RBPs
+    - 1,029 rows (4.0%) have 3 RBPs
+    - 158 rows (0.6%) have 4+ RBPs (max: 18)
+- **Total interactions**: 25,470 positive samples
 - **Protein redundancy**: Same proteins appear in multiple interactions
 
 ## Setup Instructions
@@ -98,7 +116,7 @@ Create and activate a conda environment:
 Create train/validation/test splits with RBP deduplication to prevent data leakage:
 
 ```bash
-python scripts/simple_splitting.py
+python scripts/simple_splitting.py --data_path data/dedup.labeled_marker_rbp_phageID.tsv
 ```
 
 This will:
@@ -120,7 +138,7 @@ Extract all unique protein sequences from the dataset:
 
 ```bash
 python scripts/extract_sequences.py \
-    --data_path data/dedup.phage_marker_rbp_with_phage_entropy.tsv \
+    --data_path data/dedup.labeled_marker_rbp_phageID.tsv \
     --output_dir data/sequences
 ```
 

@@ -1,5 +1,5 @@
 """
-Data utility functions for preprocessing and handling multi-instance bags
+Data utility functions for MD5 hash-based multi-instance bag loading
 """
 
 import numpy as np
@@ -7,549 +7,478 @@ import pandas as pd
 import h5py
 import pickle
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union, Set
 import logging
-import hashlib
 from collections import OrderedDict
 import atexit
 
 
-class LazyEmbeddingLoader:
+class HashBasedEmbeddingLoader:
     """
-    Lazily loads protein embeddings from HDF5 file with LRU caching
+    Loads protein embeddings using MD5 hashes as identifiers
+    Supports lazy loading with LRU caching for memory efficiency
     """
     
     def __init__(self, 
-                 embedding_path: str, 
+                 host_embedding_path: str,
+                 phage_embedding_path: str,
                  cache_size: int = 10000,
                  preload_all: bool = False,
                  logger: Optional[logging.Logger] = None):
         """
-        Initialize the lazy embedding loader
+        Initialize the hash-based embedding loader
         
         Args:
-            embedding_path: Path to HDF5 file with embeddings
+            host_embedding_path: Path to HDF5 file with host embeddings
+            phage_embedding_path: Path to HDF5 file with phage embeddings
             cache_size: Maximum number of embeddings to cache in memory
-            preload_all: If True, loads all embeddings into memory (like original behavior)
+            preload_all: If True, loads all embeddings into memory
             logger: Optional logger instance
         """
-        self.embedding_path = Path(embedding_path)
+        self.host_path = Path(host_embedding_path)
+        self.phage_path = Path(phage_embedding_path)
         self.cache_size = cache_size
         self.preload_all = preload_all
         self.logger = logger or logging.getLogger(__name__)
         
-        # LRU cache using OrderedDict
-        self._cache = OrderedDict()
-        self._file = None
-        self._hash_to_idx = {}
-        self.embedding_dim = None
-        self.total_embeddings = 0
+        # Separate caches for host and phage
+        self._host_cache = OrderedDict()
+        self._phage_cache = OrderedDict()
         
-        # Initialize the loader
+        # File handles
+        self._host_file = None
+        self._phage_file = None
+        
+        # Hash to index mappings
+        self._host_hash_to_idx = {}
+        self._phage_hash_to_idx = {}
+        
+        # Metadata
+        self.host_embedding_dim = None
+        self.phage_embedding_dim = None
+        self.total_host_embeddings = 0
+        self.total_phage_embeddings = 0
+        
+        # Initialize the loaders
         self._initialize()
         
         # Register cleanup on exit
         atexit.register(self._cleanup)
-        
+    
     def _initialize(self) -> None:
-        """Initialize the loader and build hash-to-index mapping"""
-        if not self.embedding_path.exists():
-            raise FileNotFoundError(f"Embedding file not found: {self.embedding_path}")
+        """Initialize both host and phage loaders"""
+        # Initialize host embeddings
+        if not self.host_path.exists():
+            raise FileNotFoundError(f"Host embedding file not found: {self.host_path}")
         
-        self.logger.info(f"Initializing lazy loader for {self.embedding_path}")
-        
-        # Open file and build index
-        with h5py.File(self.embedding_path, 'r') as h5f:
+        with h5py.File(self.host_path, 'r') as h5f:
             hashes_array = h5f['hashes'][:]
             embeddings_shape = h5f['embeddings'].shape
             
-            self.embedding_dim = embeddings_shape[1]
-            self.total_embeddings = embeddings_shape[0]
+            self.host_embedding_dim = embeddings_shape[1]
+            self.total_host_embeddings = embeddings_shape[0]
             
             # Build hash to index mapping
             for i, hash_val in enumerate(hashes_array):
                 if isinstance(hash_val, bytes):
                     hash_val = hash_val.decode('utf-8')
-                self._hash_to_idx[hash_val] = i
-                
-        self.logger.info(f"Initialized with {self.total_embeddings} embeddings, "
-                        f"dimension {self.embedding_dim}, cache size {self.cache_size}")
+                self._host_hash_to_idx[hash_val] = i
         
-        # Preload all if requested
+        self.logger.info(f"Loaded {self.total_host_embeddings} host embeddings, "
+                        f"dimension {self.host_embedding_dim}")
+        
+        # Initialize phage embeddings
+        if not self.phage_path.exists():
+            raise FileNotFoundError(f"Phage embedding file not found: {self.phage_path}")
+        
+        with h5py.File(self.phage_path, 'r') as h5f:
+            hashes_array = h5f['hashes'][:]
+            embeddings_shape = h5f['embeddings'].shape
+            
+            self.phage_embedding_dim = embeddings_shape[1]
+            self.total_phage_embeddings = embeddings_shape[0]
+            
+            # Build hash to index mapping
+            for i, hash_val in enumerate(hashes_array):
+                if isinstance(hash_val, bytes):
+                    hash_val = hash_val.decode('utf-8')
+                self._phage_hash_to_idx[hash_val] = i
+        
+        self.logger.info(f"Loaded {self.total_phage_embeddings} phage embeddings, "
+                        f"dimension {self.phage_embedding_dim}")
+        
+        # Check dimensions match
+        if self.host_embedding_dim != self.phage_embedding_dim:
+            raise ValueError(f"Embedding dimensions don't match: "
+                           f"host={self.host_embedding_dim}, phage={self.phage_embedding_dim}")
+        
+        self.embedding_dim = self.host_embedding_dim
+        
+        # Preload if requested
         if self.preload_all:
             self._preload_all_embeddings()
     
     def _preload_all_embeddings(self) -> None:
-        """Preload all embeddings into cache (for compatibility with original behavior)"""
+        """Preload all embeddings into memory"""
         self.logger.info("Preloading all embeddings into memory...")
         
-        with h5py.File(self.embedding_path, 'r') as h5f:
+        # Preload host embeddings
+        with h5py.File(self.host_path, 'r') as h5f:
             embeddings_array = h5f['embeddings'][:]
-            
-            for hash_val, idx in self._hash_to_idx.items():
-                self._cache[hash_val] = embeddings_array[idx]
+            for hash_val, idx in self._host_hash_to_idx.items():
+                self._host_cache[hash_val] = embeddings_array[idx]
         
-        self.logger.info(f"Preloaded {len(self._cache)} embeddings")
-    
-    def _open_file(self) -> None:
-        """Open the HDF5 file if not already open"""
-        if self._file is None:
-            self._file = h5py.File(self.embedding_path, 'r')
-    
-    def _cleanup(self) -> None:
-        """Clean up resources"""
-        if self._file is not None:
-            self._file.close()
-            self._file = None
-    
-    def get_embedding(self, protein_hash: str) -> np.ndarray:
-        """
-        Get embedding for a protein by its MD5 hash
+        # Preload phage embeddings
+        with h5py.File(self.phage_path, 'r') as h5f:
+            embeddings_array = h5f['embeddings'][:]
+            for hash_val, idx in self._phage_hash_to_idx.items():
+                self._phage_cache[hash_val] = embeddings_array[idx]
         
-        Args:
-            protein_hash: MD5 hash of the protein sequence
-            
-        Returns:
-            Embedding array
-        """
+        self.logger.info(f"Preloaded {len(self._host_cache)} host and "
+                        f"{len(self._phage_cache)} phage embeddings")
+    
+    def _get_from_cache_or_load(self, hash_val: str, is_host: bool) -> Optional[np.ndarray]:
+        """Get embedding from cache or load from file"""
+        if is_host:
+            cache = self._host_cache
+            hash_to_idx = self._host_hash_to_idx
+            file_path = self.host_path
+        else:
+            cache = self._phage_cache
+            hash_to_idx = self._phage_hash_to_idx
+            file_path = self.phage_path
+        
         # Check cache first
-        if protein_hash in self._cache:
-            # Move to end (most recently used)
-            self._cache.move_to_end(protein_hash)
-            return self._cache[protein_hash]
+        if hash_val in cache:
+            # Move to end (LRU)
+            cache.move_to_end(hash_val)
+            return cache[hash_val]
         
         # Check if hash exists
-        if protein_hash not in self._hash_to_idx:
-            raise KeyError(f"Embedding not found for hash: {protein_hash}")
+        if hash_val not in hash_to_idx:
+            return None
         
         # Load from file
-        self._open_file()
-        idx = self._hash_to_idx[protein_hash]
-        embedding = self._file['embeddings'][idx][:]
+        idx = hash_to_idx[hash_val]
+        with h5py.File(file_path, 'r') as h5f:
+            embedding = h5f['embeddings'][idx]
         
-        # Add to cache
-        self._add_to_cache(protein_hash, embedding)
+        # Add to cache with LRU eviction
+        if len(cache) >= self.cache_size:
+            # Remove oldest
+            cache.popitem(last=False)
+        cache[hash_val] = embedding
         
         return embedding
     
-    def _add_to_cache(self, hash_val: str, embedding: np.ndarray) -> None:
-        """Add embedding to cache with LRU eviction"""
-        # Check cache size
-        if len(self._cache) >= self.cache_size:
-            # Remove least recently used (first item)
-            self._cache.popitem(last=False)
-        
-        # Add new item (becomes most recently used)
-        self._cache[hash_val] = embedding
+    def get_host_embedding(self, hash_val: str) -> Optional[np.ndarray]:
+        """Get host embedding by MD5 hash"""
+        return self._get_from_cache_or_load(hash_val, is_host=True)
     
-    def get_embeddings_batch(self, protein_hashes: List[str], use_zero_for_missing: bool = True) -> np.ndarray:
+    def get_phage_embedding(self, hash_val: str) -> Optional[np.ndarray]:
+        """Get phage embedding by MD5 hash"""
+        return self._get_from_cache_or_load(hash_val, is_host=False)
+    
+    def get_host_embeddings(self, hash_list: List[str]) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Get embeddings for multiple proteins with error handling
+        Get multiple host embeddings
         
-        Args:
-            protein_hashes: List of MD5 hashes
-            use_zero_for_missing: If True, use zero vectors for missing embeddings
-            
         Returns:
-            Array of embeddings with shape (n_proteins, embedding_dim)
+            Tuple of (embeddings, mask) where mask indicates valid embeddings
         """
         embeddings = []
-        missing_count = 0
+        mask = []
         
-        for hash_val in protein_hashes:
-            try:
-                embeddings.append(self.get_embedding(hash_val))
-            except KeyError:
-                if use_zero_for_missing:
-                    self.logger.warning(f"Missing embedding for hash {hash_val}, using zero vector")
-                    embeddings.append(np.zeros(self.embedding_dim))
-                    missing_count += 1
-                else:
-                    raise
+        for hash_val in hash_list:
+            emb = self.get_host_embedding(hash_val)
+            if emb is not None:
+                embeddings.append(emb)
+                mask.append(1)
+            else:
+                embeddings.append(np.zeros(self.embedding_dim, dtype=np.float32))
+                mask.append(0)
         
-        if missing_count > 0:
-            self.logger.warning(f"Total missing embeddings: {missing_count}/{len(protein_hashes)}")
-            
-        return np.stack(embeddings) if embeddings else np.zeros((0, self.embedding_dim))
+        return np.array(embeddings), np.array(mask)
     
-    def cache_stats(self) -> Dict[str, int]:
-        """Get cache statistics"""
-        return {
-            'cache_size': len(self._cache),
-            'max_cache_size': self.cache_size,
-            'total_embeddings': self.total_embeddings,
-            'cache_hit_rate': len(self._cache) / self.total_embeddings if self.total_embeddings > 0 else 0
-        }
-    
-    def __del__(self):
-        """Cleanup on deletion"""
-        self._cleanup()
-
-
-# Keep original EmbeddingLoader for backward compatibility
-class EmbeddingLoader(LazyEmbeddingLoader):
-    """
-    Legacy embedding loader that loads all embeddings into memory
-    Kept for backward compatibility
-    """
-    
-    def __init__(self, embedding_path: str, logger: Optional[logging.Logger] = None):
+    def get_phage_embeddings(self, hash_list: List[str]) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Initialize the embedding loader (loads all into memory)
+        Get multiple phage embeddings
         
-        Args:
-            embedding_path: Path to HDF5 file with embeddings
-            logger: Optional logger instance
-        """
-        # Use lazy loader with preload_all=True and unlimited cache
-        super().__init__(
-            embedding_path=embedding_path,
-            cache_size=float('inf'),  # Unlimited cache
-            preload_all=True,  # Load everything at init
-            logger=logger
-        )
-        
-        # For backward compatibility, expose embeddings dict
-        self.embeddings = self._cache
-        
-    def get_embedding(self, protein_hash: str) -> np.ndarray:
-        """
-        Get embedding for a protein by its MD5 hash
-        
-        Args:
-            protein_hash: MD5 hash of the protein sequence
-            
         Returns:
-            Embedding array
-        """
-        if protein_hash not in self.embeddings:
-            raise KeyError(f"Embedding not found for hash: {protein_hash}")
-        return self.embeddings[protein_hash]
-    
-    def get_embeddings_batch(self, protein_hashes: List[str], use_zero_for_missing: bool = True) -> np.ndarray:
-        """
-        Get embeddings for multiple proteins with error handling
-        
-        Args:
-            protein_hashes: List of MD5 hashes
-            use_zero_for_missing: If True, use zero vectors for missing embeddings; if False, raise error
-            
-        Returns:
-            Array of embeddings with shape (n_proteins, embedding_dim)
+            Tuple of (embeddings, mask) where mask indicates valid embeddings
         """
         embeddings = []
-        missing_count = 0
+        mask = []
         
-        for hash_val in protein_hashes:
-            try:
-                embeddings.append(self.get_embedding(hash_val))
-            except KeyError:
-                if use_zero_for_missing:
-                    self.logger.warning(f"Missing embedding for hash {hash_val}, using zero vector")
-                    embeddings.append(np.zeros(self.embedding_dim))
-                    missing_count += 1
-                else:
-                    raise
+        for hash_val in hash_list:
+            emb = self.get_phage_embedding(hash_val)
+            if emb is not None:
+                embeddings.append(emb)
+                mask.append(1)
+            else:
+                embeddings.append(np.zeros(self.embedding_dim, dtype=np.float32))
+                mask.append(0)
         
-        if missing_count > 0:
-            self.logger.warning(f"Total missing embeddings: {missing_count}/{len(protein_hashes)}")
-            
-        return np.stack(embeddings) if embeddings else np.zeros((0, self.embedding_dim))
+        return np.array(embeddings), np.array(mask)
+    
+    def _cleanup(self) -> None:
+        """Clean up resources"""
+        if self._host_file is not None:
+            self._host_file.close()
+        if self._phage_file is not None:
+            self._phage_file.close()
 
 
 class MultiInstanceBag:
     """
-    Represents a multi-instance bag for a single interaction
+    Represents a multi-instance bag for phage-host interaction
+    Uses MD5 hashes to identify proteins
     """
     
-    def __init__(self, 
-                 marker_hashes: List[str],
-                 rbp_hashes: List[str],
+    def __init__(self,
+                 host_hashes: List[str],
+                 phage_hashes: List[str],
+                 label: int,
                  phage_id: str,
-                 label: int = 1):
+                 metadata: Optional[Dict] = None):
         """
         Initialize a multi-instance bag
         
         Args:
-            marker_hashes: List of marker protein MD5 hashes (host)
-            rbp_hashes: List of RBP MD5 hashes (phage)
+            host_hashes: List of MD5 hashes for host proteins (wzx, wzm)
+            phage_hashes: List of MD5 hashes for phage RBPs
+            label: Binary label (1 for positive, 0 for negative)
             phage_id: Phage identifier
-            label: Interaction label (1 for positive, 0 for negative/unlabeled)
+            metadata: Optional additional metadata
         """
-        self.marker_hashes = marker_hashes
-        self.rbp_hashes = rbp_hashes
-        self.phage_id = phage_id
+        self.host_hashes = host_hashes
+        self.phage_hashes = phage_hashes
         self.label = label
+        self.phage_id = phage_id
+        self.metadata = metadata or {}
         
-    def get_embeddings(self, embedding_loader, use_zero_for_missing: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+        # Validate
+        if not host_hashes:
+            raise ValueError("Bag must have at least one host protein")
+        if not phage_hashes:
+            raise ValueError("Bag must have at least one phage protein")
+    
+    def get_embeddings(self, 
+                      loader: HashBasedEmbeddingLoader,
+                      max_host: Optional[int] = None,
+                      max_phage: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Get embeddings for all proteins in the bag with error handling
+        Get embeddings for this bag
         
         Args:
-            embedding_loader: EmbeddingLoader or DualEmbeddingLoader instance
-            use_zero_for_missing: If True, use zero vectors for missing embeddings
+            loader: HashBasedEmbeddingLoader instance
+            max_host: Maximum number of host proteins (for padding)
+            max_phage: Maximum number of phage proteins (for padding)
             
         Returns:
-            Tuple of (marker_embeddings, rbp_embeddings)
-            
-        Raises:
-            ValueError: If no valid embeddings found for either markers or RBPs
+            Tuple of (host_embeddings, phage_embeddings, host_mask, phage_mask)
         """
-        # Check if we have a DualEmbeddingLoader
-        from utils.dual_embedding_loader import DualEmbeddingLoader
-        if isinstance(embedding_loader, DualEmbeddingLoader):
-            # Get host embeddings for markers
-            marker_embeddings = []
-            for hash_val in self.marker_hashes:
-                try:
-                    marker_embeddings.append(embedding_loader.get_host_embedding(hash_val))
-                except KeyError:
-                    if use_zero_for_missing:
-                        marker_embeddings.append(np.zeros(embedding_loader.embedding_dim))
-                    else:
-                        raise ValueError(f"Missing embedding for marker hash: {hash_val}")
-            
-            # Get phage embeddings for RBPs
-            rbp_embeddings = []
-            for hash_val in self.rbp_hashes:
-                try:
-                    rbp_embeddings.append(embedding_loader.get_phage_embedding(hash_val))
-                except KeyError:
-                    if use_zero_for_missing:
-                        rbp_embeddings.append(np.zeros(embedding_loader.embedding_dim))
-                    else:
-                        raise ValueError(f"Missing embedding for RBP hash: {hash_val}")
-            
-            marker_embeddings = np.array(marker_embeddings)
-            rbp_embeddings = np.array(rbp_embeddings)
-        else:
-            # Use legacy single loader
-            marker_embeddings = embedding_loader.get_embeddings_batch(self.marker_hashes, use_zero_for_missing)
-            rbp_embeddings = embedding_loader.get_embeddings_batch(self.rbp_hashes, use_zero_for_missing)
+        # Get host embeddings
+        host_emb, host_mask = loader.get_host_embeddings(self.host_hashes)
         
-        # Validate we have at least some non-zero embeddings
-        if marker_embeddings.shape[0] == 0 or np.all(marker_embeddings == 0):
-            raise ValueError(f"No valid marker embeddings found for phage {self.phage_id}")
-        if rbp_embeddings.shape[0] == 0 or np.all(rbp_embeddings == 0):
-            raise ValueError(f"No valid RBP embeddings found for phage {self.phage_id}")
-            
-        return marker_embeddings, rbp_embeddings
+        # Get phage embeddings
+        phage_emb, phage_mask = loader.get_phage_embeddings(self.phage_hashes)
+        
+        # Pad if needed
+        if max_host and len(host_emb) < max_host:
+            pad_size = max_host - len(host_emb)
+            host_emb = np.pad(host_emb, ((0, pad_size), (0, 0)), mode='constant')
+            host_mask = np.pad(host_mask, (0, pad_size), mode='constant')
+        elif max_host and len(host_emb) > max_host:
+            # Truncate
+            host_emb = host_emb[:max_host]
+            host_mask = host_mask[:max_host]
+        
+        if max_phage and len(phage_emb) < max_phage:
+            pad_size = max_phage - len(phage_emb)
+            phage_emb = np.pad(phage_emb, ((0, pad_size), (0, 0)), mode='constant')
+            phage_mask = np.pad(phage_mask, (0, pad_size), mode='constant')
+        elif max_phage and len(phage_emb) > max_phage:
+            # Truncate
+            phage_emb = phage_emb[:max_phage]
+            phage_mask = phage_mask[:max_phage]
+        
+        return host_emb, phage_emb, host_mask, phage_mask
     
-    def __repr__(self) -> str:
-        return (f"MultiInstanceBag(markers={len(self.marker_hashes)}, "
-                f"rbps={len(self.rbp_hashes)}, label={self.label})")
+    def __repr__(self):
+        return (f"MultiInstanceBag(hosts={len(self.host_hashes)}, "
+                f"phages={len(self.phage_hashes)}, label={self.label}, "
+                f"phage_id={self.phage_id})")
 
 
 class DataProcessor:
     """
-    Processes raw data into multi-instance bags
+    Processes data files with MD5 hash columns into MultiInstanceBags
     """
     
-    def __init__(self, 
-                 data_path: str,
-                 split_path: str,
-                 embedding_loader: EmbeddingLoader,
-                 logger: Optional[logging.Logger] = None):
+    def __init__(self, logger: Optional[logging.Logger] = None):
         """
         Initialize the data processor
         
         Args:
-            data_path: Path to the original TSV data
-            split_path: Path to the splits pickle file
-            embedding_loader: EmbeddingLoader instance
             logger: Optional logger instance
         """
-        self.data_path = Path(data_path)
-        self.split_path = Path(split_path)
-        self.embedding_loader = embedding_loader
         self.logger = logger or logging.getLogger(__name__)
-        
-        # Load data and splits
-        self.df = pd.read_csv(self.data_path, sep='\t')
-        with open(self.split_path, 'rb') as f:
-            self.splits = pickle.load(f)
-            
-        self.logger.info(f"Loaded data with {len(self.df)} samples")
-        self.logger.info(f"Train: {len(self.splits['train_idx'])}, "
-                        f"Val: {len(self.splits['val_idx'])}, "
-                        f"Test: {len(self.splits['test_idx'])}")
-        
-    def _parse_row_to_bag(self, row: pd.Series, label: int = 1) -> MultiInstanceBag:
-        """
-        Convert a dataframe row to a MultiInstanceBag
-        
-        Args:
-            row: Pandas Series representing a data row
-            label: Label for the bag
-            
-        Returns:
-            MultiInstanceBag instance
-        """
-        # Parse marker hashes
-        if ',' in str(row['marker_md5']):
-            marker_hashes = row['marker_md5'].split(',')
-        else:
-            marker_hashes = [row['marker_md5']]
-            
-        # Parse RBP hashes
-        if ',' in str(row['rbp_md5']):
-            rbp_hashes = row['rbp_md5'].split(',')
-        else:
-            rbp_hashes = [row['rbp_md5']]
-            
-        return MultiInstanceBag(
-            marker_hashes=marker_hashes,
-            rbp_hashes=rbp_hashes,
-            phage_id=row['phage_id'],
-            label=label
-        )
     
-    def get_split_data(self, split: str) -> List[MultiInstanceBag]:
+    def load_data_with_hashes(self, data_path: str) -> pd.DataFrame:
         """
-        Get multi-instance bags for a specific split
+        Load data file with hash columns
         
         Args:
-            split: One of 'train', 'val', or 'test'
+            data_path: Path to TSV file with host_md5_set and phage_md5_set columns
             
         Returns:
-            List of MultiInstanceBag instances
+            DataFrame with parsed hash columns
         """
-        if split not in ['train', 'val', 'test']:
-            raise ValueError(f"Invalid split: {split}")
+        self.logger.info(f"Loading data from {data_path}")
+        df = pd.read_csv(data_path, sep='\t')
+        
+        # Check required columns
+        required = ['host_md5_set', 'phage_md5_set', 'phage_id']
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
+        
+        self.logger.info(f"Loaded {len(df)} samples")
+        return df
+    
+    def create_bags_from_dataframe(self,
+                                  df: pd.DataFrame,
+                                  negative_ratio: float = 1.0,
+                                  seed: int = 42) -> List[MultiInstanceBag]:
+        """
+        Create MultiInstanceBags from dataframe
+        
+        Args:
+            df: DataFrame with hash columns
+            negative_ratio: Ratio of negative to positive samples
+            seed: Random seed for negative sampling
             
-        split_indices = self.splits[f'{split}_idx']
+        Returns:
+            List of MultiInstanceBag objects
+        """
+        np.random.seed(seed)
         bags = []
         
-        for idx in split_indices:
-            row = self.df.iloc[idx]
-            bag = self._parse_row_to_bag(row, label=1)  # All positive
-            bags.append(bag)
+        # Process positive samples
+        for idx, row in df.iterrows():
+            # Parse host hashes
+            host_hashes = []
+            if pd.notna(row['host_md5_set']) and row['host_md5_set']:
+                host_hashes = [h.strip() for h in str(row['host_md5_set']).split(',') 
+                             if h.strip() and h.strip() != 'nan']
             
-        self.logger.info(f"Created {len(bags)} bags for {split} split")
+            # Parse phage hashes
+            phage_hashes = []
+            if pd.notna(row['phage_md5_set']) and row['phage_md5_set']:
+                phage_hashes = [h.strip() for h in str(row['phage_md5_set']).split(',')
+                              if h.strip() and h.strip() != 'nan']
+            
+            # Skip if empty
+            if not host_hashes or not phage_hashes:
+                self.logger.warning(f"Skipping row {idx}: empty host or phage hashes")
+                continue
+            
+            # Create positive bag
+            bag = MultiInstanceBag(
+                host_hashes=host_hashes,
+                phage_hashes=phage_hashes,
+                label=1,
+                phage_id=str(row['phage_id'])
+            )
+            bags.append(bag)
+        
+        n_positive = len(bags)
+        self.logger.info(f"Created {n_positive} positive bags")
+        
+        # Generate negative samples if requested
+        if negative_ratio > 0:
+            n_negative = int(n_positive * negative_ratio)
+            negative_bags = self._generate_negative_samples(df, n_negative, seed)
+            bags.extend(negative_bags)
+            self.logger.info(f"Generated {len(negative_bags)} negative bags")
+        
         return bags
     
-    def generate_negative_samples(self, 
-                                 positive_bags: List[MultiInstanceBag],
-                                 negative_ratio: float = 1.0,
-                                 seed: int = 42) -> List[MultiInstanceBag]:
+    def _generate_negative_samples(self,
+                                  df: pd.DataFrame,
+                                  n_samples: int,
+                                  seed: int) -> List[MultiInstanceBag]:
         """
         Generate negative samples by random pairing
         
         Args:
-            positive_bags: List of positive MultiInstanceBag instances
-            negative_ratio: Ratio of negative to positive samples
+            df: DataFrame with positive samples
+            n_samples: Number of negative samples to generate
             seed: Random seed
             
         Returns:
-            List of negative MultiInstanceBag instances
+            List of negative MultiInstanceBag objects
         """
         np.random.seed(seed)
-        
-        # Collect all unique markers and RBPs
-        all_markers = set()
-        all_rbps = set()
-        
-        for bag in positive_bags:
-            all_markers.update(bag.marker_hashes)
-            all_rbps.update(bag.rbp_hashes)
-            
-        all_markers = list(all_markers)
-        all_rbps = list(all_rbps)
-        
-        # Generate negative samples
-        n_negative = int(len(positive_bags) * negative_ratio)
         negative_bags = []
         
-        # Keep track of positive pairs to avoid
+        # Collect all unique host and phage hash sets
+        all_host_sets = []
+        all_phage_sets = []
+        
+        for idx, row in df.iterrows():
+            # Host hashes
+            if pd.notna(row['host_md5_set']) and row['host_md5_set']:
+                host_hashes = [h.strip() for h in str(row['host_md5_set']).split(',')
+                             if h.strip() and h.strip() != 'nan']
+                if host_hashes:
+                    all_host_sets.append(host_hashes)
+            
+            # Phage hashes
+            if pd.notna(row['phage_md5_set']) and row['phage_md5_set']:
+                phage_hashes = [h.strip() for h in str(row['phage_md5_set']).split(',')
+                              if h.strip() and h.strip() != 'nan']
+                if phage_hashes:
+                    all_phage_sets.append(phage_hashes)
+        
+        # Create set of positive pairs for checking
         positive_pairs = set()
-        for bag in positive_bags:
-            for m in bag.marker_hashes:
-                for r in bag.rbp_hashes:
-                    positive_pairs.add((m, r))
+        for idx, row in df.iterrows():
+            host_str = str(row['host_md5_set'])
+            phage_str = str(row['phage_md5_set'])
+            positive_pairs.add((host_str, phage_str))
         
+        # Generate negative samples
         attempts = 0
-        max_attempts = n_negative * 10
+        max_attempts = n_samples * 10
         
-        while len(negative_bags) < n_negative and attempts < max_attempts:
+        while len(negative_bags) < n_samples and attempts < max_attempts:
             attempts += 1
             
-            # Random sample markers and RBPs
-            n_markers = np.random.choice([1, 2], p=[0.2, 0.8])  # Match distribution
-            n_rbps = np.random.choice([1, 2, 3], p=[0.7, 0.25, 0.05])
+            # Random selection
+            host_idx = np.random.randint(len(all_host_sets))
+            phage_idx = np.random.randint(len(all_phage_sets))
             
-            marker_hashes = list(np.random.choice(all_markers, n_markers, replace=False))
-            rbp_hashes = list(np.random.choice(all_rbps, n_rbps, replace=False))
+            host_hashes = all_host_sets[host_idx]
+            phage_hashes = all_phage_sets[phage_idx]
             
-            # Check if any pair is positive
-            is_positive = False
-            for m in marker_hashes:
-                for r in rbp_hashes:
-                    if (m, r) in positive_pairs:
-                        is_positive = True
-                        break
-                if is_positive:
-                    break
-                    
-            if not is_positive:
-                negative_bags.append(MultiInstanceBag(
-                    marker_hashes=marker_hashes,
-                    rbp_hashes=rbp_hashes,
-                    phage_id=f"negative_{len(negative_bags)}",
-                    label=0
-                ))
-                
-        self.logger.info(f"Generated {len(negative_bags)} negative samples")
+            # Check if this is a positive pair
+            host_str = ','.join(host_hashes)
+            phage_str = ','.join(phage_hashes)
+            
+            if (host_str, phage_str) not in positive_pairs:
+                # Create negative bag
+                bag = MultiInstanceBag(
+                    host_hashes=host_hashes,
+                    phage_hashes=phage_hashes,
+                    label=0,
+                    phage_id=f"neg_{len(negative_bags)}"
+                )
+                negative_bags.append(bag)
+        
+        if len(negative_bags) < n_samples:
+            self.logger.warning(f"Could only generate {len(negative_bags)}/{n_samples} negative samples")
+        
         return negative_bags
 
-
-def collate_bags(bags: List[MultiInstanceBag], 
-                 embedding_loader: EmbeddingLoader,
-                 pad_to_max: bool = True) -> Dict[str, np.ndarray]:
-    """
-    Collate a list of bags into batch tensors
-    
-    Args:
-        bags: List of MultiInstanceBag instances
-        embedding_loader: EmbeddingLoader instance
-        pad_to_max: Whether to pad to maximum length in batch
-        
-    Returns:
-        Dictionary with batch tensors
-    """
-    batch_size = len(bags)
-    
-    # Get maximum lengths
-    max_markers = max(len(bag.marker_hashes) for bag in bags)
-    max_rbps = max(len(bag.rbp_hashes) for bag in bags)
-    
-    embedding_dim = embedding_loader.embedding_dim
-    
-    # Initialize arrays
-    marker_embeddings = np.zeros((batch_size, max_markers, embedding_dim), dtype=np.float32)
-    rbp_embeddings = np.zeros((batch_size, max_rbps, embedding_dim), dtype=np.float32)
-    marker_mask = np.zeros((batch_size, max_markers), dtype=np.float32)
-    rbp_mask = np.zeros((batch_size, max_rbps), dtype=np.float32)
-    labels = np.array([bag.label for bag in bags], dtype=np.float32)
-    
-    # Fill arrays
-    for i, bag in enumerate(bags):
-        # Get embeddings
-        m_emb, r_emb = bag.get_embeddings(embedding_loader)
-        
-        # Fill marker embeddings and mask
-        n_markers = len(bag.marker_hashes)
-        marker_embeddings[i, :n_markers] = m_emb
-        marker_mask[i, :n_markers] = 1.0
-        
-        # Fill RBP embeddings and mask
-        n_rbps = len(bag.rbp_hashes)
-        rbp_embeddings[i, :n_rbps] = r_emb
-        rbp_mask[i, :n_rbps] = 1.0
-        
-    return {
-        'marker_embeddings': marker_embeddings,
-        'rbp_embeddings': rbp_embeddings,
-        'marker_mask': marker_mask,
-        'rbp_mask': rbp_mask,
-        'labels': labels
-    }

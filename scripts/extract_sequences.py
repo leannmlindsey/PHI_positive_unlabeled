@@ -1,315 +1,254 @@
 """
-Extract and deduplicate protein sequences from the dataset
-Creates separate FASTA files for host and phage proteins
+Extract, hash, and deduplicate protein sequences from the new data format
+Creates separate files for host (wzx, wzm) and phage (rbp) proteins
+Adds MD5 hash columns to the original data file
 """
 
 import os
-import sys
 import hashlib
 import argparse
 from pathlib import Path
-from typing import Dict, Set, Tuple
+from typing import Dict, Set, List, Tuple
 import pandas as pd
 from tqdm import tqdm
 import json
+import numpy as np
 
 
-def extract_and_deduplicate_sequences(data_path: str, output_dir: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+def compute_md5(sequence: str) -> str:
+    """Compute MD5 hash for a protein sequence"""
+    return hashlib.md5(sequence.strip().upper().encode()).hexdigest()
+
+
+def extract_all_sequences(data_path: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
     Extract all unique protein sequences from the dataset
     
     Args:
-        data_path: Path to the TSV data file
-        output_dir: Directory to save output files
+        data_path: Path to the TSV data file (no header)
         
     Returns:
         Tuple of (host_sequences, phage_sequences) dictionaries
+        Each dict maps MD5 hash -> sequence
     """
     print(f"Loading data from {data_path}")
-    df = pd.read_csv(data_path, sep='\t')
+    
+    # Load data without header
+    columns = ['wzx_seq', 'wzm_seq', 'rbp_seq', 'phage_id']
+    df = pd.read_csv(data_path, sep='\t', header=None, names=columns)
     print(f"Loaded {len(df)} interactions")
     
-    host_sequences = {}  # hash -> sequence
-    phage_sequences = {}  # hash -> sequence
+    host_sequences = {}  # MD5 hash -> sequence
+    phage_sequences = {}  # MD5 hash -> sequence
     
-    # Track problematic rows
-    problematic_rows = []
+    # Statistics
+    stats = {
+        'total_wzx': 0,
+        'unique_wzx': 0,
+        'total_wzm': 0,
+        'unique_wzm': 0,
+        'total_rbp': 0,
+        'unique_rbp': 0,
+        'empty_wzx': 0,
+        'empty_wzm': 0,
+        'multi_rbp_rows': 0
+    }
     
-    # Process each row
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing sequences"):
-        # Process marker (host) sequences
-        marker_seqs_raw = str(row['marker_gene_seq'])
-        marker_hashes_raw = str(row['marker_md5'])
-        
-        # Handle multiple sequences (some entries have comma-separated sequences)
-        if ',' in marker_seqs_raw:
-            # This means multiple sequences are concatenated with commas
-            # But we only have one hash - this is the problematic case
-            # For now, treat the entire string as one sequence
-            seq = marker_seqs_raw.replace(',', '')  # Remove commas
-            computed_hash = hashlib.md5(seq.encode()).hexdigest()
+    print("\nExtracting and hashing sequences...")
+    
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing"):
+        # Process wzx sequence
+        wzx_seq = str(row['wzx_seq']).strip()
+        if wzx_seq and wzx_seq != 'nan' and wzx_seq != 'NaN' and wzx_seq != '':
+            wzx_hash = compute_md5(wzx_seq)
+            host_sequences[wzx_hash] = wzx_seq
+            stats['total_wzx'] += 1
+        else:
+            stats['empty_wzx'] += 1
             
-            # Use the provided hash if it matches, otherwise compute new one
-            if ',' not in marker_hashes_raw:
-                provided_hash = marker_hashes_raw.strip()
-                if hashlib.md5(marker_seqs_raw.encode()).hexdigest() == provided_hash:
-                    # The hash was computed on the comma-separated string
-                    host_sequences[provided_hash] = marker_seqs_raw
-                else:
-                    # Use the concatenated sequence
-                    host_sequences[computed_hash] = seq
-                    problematic_rows.append((idx, 'marker', 'comma-separated sequences'))
-            else:
-                # Multiple hashes provided
-                marker_seqs = marker_seqs_raw.split(',')
-                marker_hashes = marker_hashes_raw.split(',')
-                
-                if len(marker_seqs) == len(marker_hashes):
-                    for seq, hash_val in zip(marker_seqs, marker_hashes):
-                        seq = seq.strip()
-                        hash_val = hash_val.strip()
-                        if seq and hash_val:
-                            host_sequences[hash_val] = seq
-                else:
-                    # Mismatch in counts - compute hash for concatenated sequence
-                    host_sequences[computed_hash] = seq
-                    problematic_rows.append((idx, 'marker', f'{len(marker_seqs)} seqs, {len(marker_hashes)} hashes'))
+        # Process wzm sequence  
+        wzm_seq = str(row['wzm_seq']).strip()
+        if wzm_seq and wzm_seq != 'nan' and wzm_seq != 'NaN' and wzm_seq != '':
+            wzm_hash = compute_md5(wzm_seq)
+            host_sequences[wzm_hash] = wzm_seq
+            stats['total_wzm'] += 1
         else:
-            # Single sequence
-            seq = marker_seqs_raw.strip()
-            hash_val = marker_hashes_raw.strip()
-            if seq and hash_val:
-                host_sequences[hash_val] = seq
-        
-        # Process RBP (phage) sequences
-        rbp_seqs_raw = str(row['rbp_seq'])
-        rbp_hashes_raw = str(row['rbp_md5'])
-        
-        # Handle multiple sequences
-        if ',' in rbp_seqs_raw:
-            # Multiple sequences concatenated with commas
-            if ',' not in rbp_hashes_raw:
-                # Only one hash for multiple sequences - problematic
-                seq = rbp_seqs_raw.replace(',', '')  # Remove commas
-                computed_hash = hashlib.md5(seq.encode()).hexdigest()
-                
-                provided_hash = rbp_hashes_raw.strip()
-                if hashlib.md5(rbp_seqs_raw.encode()).hexdigest() == provided_hash:
-                    # The hash was computed on the comma-separated string
-                    phage_sequences[provided_hash] = rbp_seqs_raw
-                else:
-                    # Use the concatenated sequence
-                    phage_sequences[computed_hash] = seq
-                    problematic_rows.append((idx, 'rbp', 'comma-separated sequences'))
-            else:
-                # Multiple hashes provided
-                rbp_seqs = rbp_seqs_raw.split(',')
-                rbp_hashes = rbp_hashes_raw.split(',')
-                
-                if len(rbp_seqs) == len(rbp_hashes):
-                    for seq, hash_val in zip(rbp_seqs, rbp_hashes):
-                        seq = seq.strip()
-                        hash_val = hash_val.strip()
-                        if seq and hash_val:
-                            phage_sequences[hash_val] = seq
-                else:
-                    # Mismatch in counts - compute hash for concatenated sequence
-                    seq = rbp_seqs_raw.replace(',', '')
-                    computed_hash = hashlib.md5(seq.encode()).hexdigest()
-                    phage_sequences[computed_hash] = seq
-                    problematic_rows.append((idx, 'rbp', f'{len(rbp_seqs)} seqs, {len(rbp_hashes)} hashes'))
+            stats['empty_wzm'] += 1
+            
+        # Process RBP sequences (can be comma-separated)
+        rbp_field = str(row['rbp_seq']).strip()
+        if ',' in rbp_field:
+            stats['multi_rbp_rows'] += 1
+            rbp_seqs = [seq.strip() for seq in rbp_field.split(',') if seq.strip()]
         else:
-            # Single sequence
-            seq = rbp_seqs_raw.strip()
-            hash_val = rbp_hashes_raw.strip()
-            if seq and hash_val:
-                phage_sequences[hash_val] = seq
+            rbp_seqs = [rbp_field] if rbp_field and rbp_field != 'nan' else []
+            
+        for rbp_seq in rbp_seqs:
+            if rbp_seq and rbp_seq != 'nan' and rbp_seq != 'NaN' and rbp_seq != '':
+                rbp_hash = compute_md5(rbp_seq)
+                phage_sequences[rbp_hash] = rbp_seq
+                stats['total_rbp'] += 1
     
-    print(f"\nFound {len(host_sequences)} unique host sequences")
-    print(f"Found {len(phage_sequences)} unique phage sequences")
-    print(f"Found {len(problematic_rows)} problematic rows")
+    # Count unique sequences
+    unique_wzx = set()
+    unique_wzm = set()
+    for hash_val, seq in host_sequences.items():
+        # Rough heuristic: wzx sequences are typically longer than wzm
+        if len(seq) > 300:  # This threshold may need adjustment
+            unique_wzx.add(hash_val)
+        else:
+            unique_wzm.add(hash_val)
     
-    if problematic_rows:
-        print("\nFirst 10 problematic rows:")
-        for row_idx, seq_type, issue in problematic_rows[:10]:
-            print(f"  Row {row_idx} ({seq_type}): {issue}")
+    stats['unique_wzx'] = len(unique_wzx)
+    stats['unique_wzm'] = len(unique_wzm)
+    stats['unique_rbp'] = len(phage_sequences)
     
-    # Verify hashes
-    print("\nVerifying host sequence hashes...")
-    host_mismatches = verify_hashes(host_sequences)
-    
-    print("Verifying phage sequence hashes...")
-    phage_mismatches = verify_hashes(phage_sequences)
+    # Print statistics
+    print("\n=== Extraction Statistics ===")
+    print(f"Total wzx sequences: {stats['total_wzx']}")
+    print(f"Total wzm sequences: {stats['total_wzm']}")
+    print(f"Total RBP sequences: {stats['total_rbp']}")
+    print(f"Unique host sequences: {len(host_sequences)}")
+    print(f"  Estimated unique wzx: {stats['unique_wzx']}")
+    print(f"  Estimated unique wzm: {stats['unique_wzm']}")
+    print(f"Unique phage sequences: {stats['unique_rbp']}")
+    print(f"Rows with multiple RBPs: {stats['multi_rbp_rows']}")
+    print(f"Empty wzx fields: {stats['empty_wzx']}")
+    print(f"Empty wzm fields: {stats['empty_wzm']}")
     
     return host_sequences, phage_sequences
 
 
-def verify_hashes(sequences: Dict[str, str]) -> int:
+def add_hash_columns_to_data(data_path: str, output_path: str) -> pd.DataFrame:
     """
-    Verify MD5 hashes match the sequences
+    Add MD5 hash columns to the original data file
+    Creates two new columns: host_md5_set and phage_md5_set
     
     Args:
-        sequences: Dictionary mapping hash to sequence
+        data_path: Path to original TSV file
+        output_path: Path to save enhanced TSV file
         
     Returns:
-        Number of mismatches
+        DataFrame with added hash columns
     """
-    mismatches = 0
-    for hash_val, seq in sequences.items():
-        # Check if sequence contains commas (concatenated sequences)
-        if ',' in seq:
-            # For comma-separated sequences, check if hash matches the full string
-            computed_hash = hashlib.md5(seq.encode()).hexdigest()
-            if computed_hash != hash_val:
-                # Also try without commas
-                seq_no_comma = seq.replace(',', '')
-                computed_hash_no_comma = hashlib.md5(seq_no_comma.encode()).hexdigest()
-                if computed_hash_no_comma != hash_val:
-                    mismatches += 1
+    print(f"\nAdding hash columns to data file...")
+    
+    # Load data
+    columns = ['wzx_seq', 'wzm_seq', 'rbp_seq', 'phage_id']
+    df = pd.read_csv(data_path, sep='\t', header=None, names=columns)
+    
+    # Create hash columns
+    host_hashes = []
+    phage_hashes = []
+    
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Computing hashes"):
+        # Host hashes (wzx and wzm)
+        host_set = []
+        
+        wzx_seq = str(row['wzx_seq']).strip()
+        if wzx_seq and wzx_seq != 'nan' and wzx_seq != 'NaN' and wzx_seq != '':
+            host_set.append(compute_md5(wzx_seq))
+            
+        wzm_seq = str(row['wzm_seq']).strip()
+        if wzm_seq and wzm_seq != 'nan' and wzm_seq != 'NaN' and wzm_seq != '':
+            host_set.append(compute_md5(wzm_seq))
+            
+        host_hashes.append(','.join(host_set))
+        
+        # Phage hashes (RBPs)
+        phage_set = []
+        rbp_field = str(row['rbp_seq']).strip()
+        
+        if ',' in rbp_field:
+            rbp_seqs = [seq.strip() for seq in rbp_field.split(',') if seq.strip()]
         else:
-            computed_hash = hashlib.md5(seq.encode()).hexdigest()
-            if computed_hash != hash_val:
-                mismatches += 1
+            rbp_seqs = [rbp_field] if rbp_field and rbp_field != 'nan' else []
+            
+        for rbp_seq in rbp_seqs:
+            if rbp_seq and rbp_seq != 'nan' and rbp_seq != 'NaN' and rbp_seq != '':
+                phage_set.append(compute_md5(rbp_seq))
+                
+        phage_hashes.append(','.join(phage_set))
     
-    if mismatches > 0:
-        print(f"  Warning: {mismatches} hash mismatches found")
-    else:
-        print(f"  All {len(sequences)} hashes verified successfully")
+    # Add columns to dataframe
+    df['host_md5_set'] = host_hashes
+    df['phage_md5_set'] = phage_hashes
     
-    return mismatches
+    # Save enhanced dataframe
+    df.to_csv(output_path, sep='\t', index=False)
+    print(f"Saved enhanced data to {output_path}")
+    
+    # Print sample
+    print("\nSample of enhanced data:")
+    print(df[['phage_id', 'host_md5_set', 'phage_md5_set']].head())
+    
+    return df
 
 
-def save_sequences_fasta(sequences: Dict[str, str], output_path: str, seq_type: str):
+def save_sequences(sequences: Dict[str, str], output_path: str, file_type: str):
     """
-    Save sequences to FASTA file
+    Save sequences to JSON and FASTA files
     
     Args:
-        sequences: Dictionary mapping hash to sequence
-        output_path: Path to save FASTA file
-        seq_type: Type of sequences (host/phage)
+        sequences: Dictionary mapping MD5 hash to sequence
+        output_path: Base path for output files (without extension)
+        file_type: Type of sequences ('host' or 'phage')
     """
-    with open(output_path, 'w') as f:
-        for hash_val, seq in sequences.items():
-            # Clean sequence - remove commas if present
-            clean_seq = seq.replace(',', '') if ',' in seq else seq
-            f.write(f">{seq_type}_{hash_val}\n")
-            # Write sequence in 80-character lines
-            for i in range(0, len(clean_seq), 80):
-                f.write(clean_seq[i:i+80] + '\n')
+    # Save as JSON
+    json_path = f"{output_path}_{file_type}_sequences.json"
+    with open(json_path, 'w') as f:
+        json.dump(sequences, f, indent=2)
+    print(f"Saved {len(sequences)} {file_type} sequences to {json_path}")
     
-    print(f"Saved {len(sequences)} {seq_type} sequences to {output_path}")
-
-
-def save_sequences_json(sequences: Dict[str, str], output_path: str):
-    """
-    Save sequences to JSON file
-    
-    Args:
-        sequences: Dictionary mapping hash to sequence
-        output_path: Path to save JSON file
-    """
-    # Clean sequences - remove commas if present
-    clean_sequences = {}
-    for hash_val, seq in sequences.items():
-        clean_seq = seq.replace(',', '') if ',' in seq else seq
-        clean_sequences[hash_val] = clean_seq
-    
-    with open(output_path, 'w') as f:
-        json.dump(clean_sequences, f, indent=2)
-    
-    print(f"Saved {len(sequences)} sequences to {output_path}")
-
-
-def save_mapping_file(host_sequences: Dict[str, str], phage_sequences: Dict[str, str], 
-                     data_path: str, output_path: str):
-    """
-    Save a mapping file that tracks which hashes belong to each interaction
-    
-    Args:
-        host_sequences: Dictionary of host sequences
-        phage_sequences: Dictionary of phage sequences
-        data_path: Path to original data file
-        output_path: Path to save mapping file
-    """
-    df = pd.read_csv(data_path, sep='\t')
-    
-    mappings = []
-    for idx, row in df.iterrows():
-        # Get original hashes
-        marker_hashes = str(row['marker_md5']).strip()
-        rbp_hashes = str(row['rbp_md5']).strip()
-        
-        # Handle cases where we might have recomputed hashes
-        if ',' in str(row['marker_gene_seq']) and ',' not in marker_hashes:
-            # Recompute hash for concatenated sequence
-            seq = str(row['marker_gene_seq']).replace(',', '')
-            marker_hashes = hashlib.md5(seq.encode()).hexdigest()
-        
-        if ',' in str(row['rbp_seq']) and ',' not in rbp_hashes:
-            # Recompute hash for concatenated sequence
-            seq = str(row['rbp_seq']).replace(',', '')
-            rbp_hashes = hashlib.md5(seq.encode()).hexdigest()
-        
-        mappings.append({
-            'index': idx,
-            'phage_id': row['phage_id'],
-            'marker_hashes': marker_hashes,
-            'rbp_hashes': rbp_hashes,
-            'rbp_length': row['rbp_length'],
-            'shannon_entropy': row['shannon_entropy'],
-            'n_unique_markers': row['n_unique_markers']
-        })
-    
-    mapping_df = pd.DataFrame(mappings)
-    mapping_df.to_csv(output_path, sep='\t', index=False)
-    print(f"Saved interaction mappings to {output_path}")
+    # Save as FASTA
+    fasta_path = f"{output_path}_{file_type}_sequences.fasta"
+    with open(fasta_path, 'w') as f:
+        for hash_id, sequence in sequences.items():
+            f.write(f">{hash_id}\n{sequence}\n")
+    print(f"Saved {len(sequences)} {file_type} sequences to {fasta_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract and deduplicate protein sequences")
-    parser.add_argument("--data_path", type=str, required=True,
-                       help="Path to the TSV data file")
-    parser.add_argument("--output_dir", type=str, default="data/sequences",
-                       help="Output directory for sequence files")
+    parser = argparse.ArgumentParser(description='Extract and process sequences with MD5 hashing')
+    parser.add_argument('--data_path', type=str, 
+                       default='data/dedup.labeled_marker_rbp_phageID.tsv',
+                       help='Path to input TSV file')
+    parser.add_argument('--output_dir', type=str, 
+                       default='data/sequences',
+                       help='Directory to save output files')
+    parser.add_argument('--enhanced_data_path', type=str,
+                       default='data/dedup.labeled_marker_rbp_phageID_with_hashes.tsv',
+                       help='Path to save data file with hash columns')
     
     args = parser.parse_args()
     
     # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    # Extract sequences
-    host_sequences, phage_sequences = extract_and_deduplicate_sequences(
-        args.data_path, args.output_dir
-    )
+    # Extract and deduplicate sequences
+    host_sequences, phage_sequences = extract_all_sequences(args.data_path)
     
-    # Save sequences in multiple formats
-    print("\nSaving sequence files...")
+    # Save sequences
+    output_base = os.path.join(args.output_dir, 'dedup')
+    save_sequences(host_sequences, output_base, 'host')
+    save_sequences(phage_sequences, output_base, 'phage')
     
-    # FASTA format
-    save_sequences_fasta(host_sequences, output_dir / "host_sequences.fasta", "host")
-    save_sequences_fasta(phage_sequences, output_dir / "phage_sequences.fasta", "phage")
+    # Add hash columns to data file
+    enhanced_df = add_hash_columns_to_data(args.data_path, args.enhanced_data_path)
     
-    # JSON format (for easy loading)
-    save_sequences_json(host_sequences, output_dir / "host_sequences.json")
-    save_sequences_json(phage_sequences, output_dir / "phage_sequences.json")
+    # Save a mapping file for reference
+    mapping_path = os.path.join(args.output_dir, 'sequence_stats.txt')
+    with open(mapping_path, 'w') as f:
+        f.write(f"Total unique host sequences: {len(host_sequences)}\n")
+        f.write(f"Total unique phage sequences: {len(phage_sequences)}\n")
+        f.write(f"Total interactions: {len(enhanced_df)}\n")
+        f.write(f"\nHost sequences with empty MD5 sets: {(enhanced_df['host_md5_set'] == '').sum()}\n")
+        f.write(f"Phage sequences with empty MD5 sets: {(enhanced_df['phage_md5_set'] == '').sum()}\n")
     
-    # Save mapping file
-    save_mapping_file(host_sequences, phage_sequences, args.data_path, 
-                     output_dir / "sequence_mappings.tsv")
-    
-    # Save statistics
-    stats = {
-        'n_host_sequences': len(host_sequences),
-        'n_phage_sequences': len(phage_sequences),
-        'total_sequences': len(host_sequences) + len(phage_sequences)
-    }
-    
-    with open(output_dir / "sequence_stats.json", 'w') as f:
-        json.dump(stats, f, indent=2)
-    
-    print("\nSequence extraction completed!")
-    print(f"Output files saved to: {output_dir}")
+    print(f"\nSaved statistics to {mapping_path}")
+    print("\n=== Processing Complete ===")
+    print(f"Enhanced data file: {args.enhanced_data_path}")
+    print(f"Sequence files: {args.output_dir}")
 
 
 if __name__ == "__main__":
