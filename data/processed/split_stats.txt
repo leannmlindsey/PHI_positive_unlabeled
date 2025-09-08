@@ -1,0 +1,5 @@
+train_size: 14876
+val_size: 4375
+test_size: 4363
+total_samples: 24794
+samples_used: 23614
