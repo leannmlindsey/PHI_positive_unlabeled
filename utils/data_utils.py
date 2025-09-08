@@ -365,26 +365,38 @@ class DataProcessor:
         np.random.seed(seed)
         bags = []
         
+        # Count skipped rows
+        skipped_count = 0
+        
         # Process positive samples
         for idx, row in df.iterrows():
+            # Check if host_md5_set is NaN or 'nan' string
+            if pd.isna(row['host_md5_set']) or str(row['host_md5_set']).strip() == 'nan':
+                skipped_count += 1
+                continue
+                
+            # Check if phage_md5_set is NaN or empty
+            if pd.isna(row['phage_md5_set']) or str(row['phage_md5_set']).strip() == '':
+                skipped_count += 1
+                continue
+            
             # Parse host hashes
             host_hashes = []
             host_field = str(row['host_md5_set']).strip()
-            if pd.notna(row['host_md5_set']) and host_field and host_field != 'nan' and host_field != '':
+            if host_field and host_field != '':
                 host_hashes = [h.strip() for h in host_field.split(',') 
                              if h.strip() and h.strip() != 'nan' and h.strip() != '']
             
             # Parse phage hashes
             phage_hashes = []
             phage_field = str(row['phage_md5_set']).strip()
-            if pd.notna(row['phage_md5_set']) and phage_field and phage_field != 'nan' and phage_field != '':
+            if phage_field and phage_field != '':
                 phage_hashes = [h.strip() for h in phage_field.split(',')
                               if h.strip() and h.strip() != 'nan' and h.strip() != '']
             
-            # Skip if empty
+            # Skip if empty after parsing
             if not host_hashes or not phage_hashes:
-                self.logger.warning(f"Skipping row {idx}: empty host or phage hashes (host={len(host_hashes)}, phage={len(phage_hashes)})")
-                self.logger.debug(f"  Raw host field: '{row.get('host_md5_set', '')}', Raw phage field: '{row.get('phage_md5_set', '')}' ")
+                skipped_count += 1
                 continue
             
             # Create positive bag
@@ -397,7 +409,7 @@ class DataProcessor:
             bags.append(bag)
         
         n_positive = len(bags)
-        self.logger.info(f"Created {n_positive} positive bags")
+        self.logger.info(f"Created {n_positive} positive bags (skipped {skipped_count} rows with missing data)")
         
         # Generate negative samples if requested
         if negative_ratio > 0:
