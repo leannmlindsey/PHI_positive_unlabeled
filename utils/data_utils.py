@@ -281,12 +281,12 @@ class MultiInstanceBag:
         self.phage_id = phage_id
         self.label = label
         
-    def get_embeddings(self, embedding_loader: EmbeddingLoader, use_zero_for_missing: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+    def get_embeddings(self, embedding_loader, use_zero_for_missing: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get embeddings for all proteins in the bag with error handling
         
         Args:
-            embedding_loader: EmbeddingLoader instance
+            embedding_loader: EmbeddingLoader or DualEmbeddingLoader instance
             use_zero_for_missing: If True, use zero vectors for missing embeddings
             
         Returns:
@@ -295,8 +295,37 @@ class MultiInstanceBag:
         Raises:
             ValueError: If no valid embeddings found for either markers or RBPs
         """
-        marker_embeddings = embedding_loader.get_embeddings_batch(self.marker_hashes, use_zero_for_missing)
-        rbp_embeddings = embedding_loader.get_embeddings_batch(self.rbp_hashes, use_zero_for_missing)
+        # Check if we have a DualEmbeddingLoader
+        from utils.dual_embedding_loader import DualEmbeddingLoader
+        if isinstance(embedding_loader, DualEmbeddingLoader):
+            # Get host embeddings for markers
+            marker_embeddings = []
+            for hash_val in self.marker_hashes:
+                try:
+                    marker_embeddings.append(embedding_loader.get_host_embedding(hash_val))
+                except KeyError:
+                    if use_zero_for_missing:
+                        marker_embeddings.append(np.zeros(embedding_loader.embedding_dim))
+                    else:
+                        raise ValueError(f"Missing embedding for marker hash: {hash_val}")
+            
+            # Get phage embeddings for RBPs
+            rbp_embeddings = []
+            for hash_val in self.rbp_hashes:
+                try:
+                    rbp_embeddings.append(embedding_loader.get_phage_embedding(hash_val))
+                except KeyError:
+                    if use_zero_for_missing:
+                        rbp_embeddings.append(np.zeros(embedding_loader.embedding_dim))
+                    else:
+                        raise ValueError(f"Missing embedding for RBP hash: {hash_val}")
+            
+            marker_embeddings = np.array(marker_embeddings)
+            rbp_embeddings = np.array(rbp_embeddings)
+        else:
+            # Use legacy single loader
+            marker_embeddings = embedding_loader.get_embeddings_batch(self.marker_hashes, use_zero_for_missing)
+            rbp_embeddings = embedding_loader.get_embeddings_batch(self.rbp_hashes, use_zero_for_missing)
         
         # Validate we have at least some non-zero embeddings
         if marker_embeddings.shape[0] == 0 or np.all(marker_embeddings == 0):

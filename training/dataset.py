@@ -203,17 +203,34 @@ class PhageHostDataModule:
         self.cache_size = cache_size
         self.logger = logger or logging.getLogger(__name__)
         
-        # Load embeddings with optional lazy loading
-        self.logger.info(f"Loading embeddings from {embeddings_path} (lazy={lazy_loading})")
-        if lazy_loading:
-            from utils.data_utils import LazyEmbeddingLoader
-            self.embedding_loader = LazyEmbeddingLoader(
-                embeddings_path, 
+        # Load embeddings - check if we have separate host/phage files
+        embeddings_dir = Path(embeddings_path)
+        host_embeddings_file = embeddings_dir / 'host_embeddings.h5'
+        phage_embeddings_file = embeddings_dir / 'phage_embeddings.h5'
+        
+        if host_embeddings_file.exists() and phage_embeddings_file.exists():
+            # Use dual embedding loader for separate files
+            self.logger.info(f"Loading separate host and phage embeddings from {embeddings_path}")
+            from utils.dual_embedding_loader import DualEmbeddingLoader
+            self.embedding_loader = DualEmbeddingLoader(
+                host_embeddings_path=str(host_embeddings_file),
+                phage_embeddings_path=str(phage_embeddings_file),
                 cache_size=cache_size,
+                preload_all=not lazy_loading,
                 logger=self.logger
             )
         else:
-            self.embedding_loader = EmbeddingLoader(embeddings_path, self.logger)
+            # Fall back to single file loader (legacy)
+            self.logger.info(f"Loading embeddings from {embeddings_path} (lazy={lazy_loading})")
+            if lazy_loading:
+                from utils.data_utils import LazyEmbeddingLoader
+                self.embedding_loader = LazyEmbeddingLoader(
+                    embeddings_path, 
+                    cache_size=cache_size,
+                    logger=self.logger
+                )
+            else:
+                self.embedding_loader = EmbeddingLoader(embeddings_path, self.logger)
         
         # Load data processor
         self.logger.info(f"Loading data from {data_path}")
