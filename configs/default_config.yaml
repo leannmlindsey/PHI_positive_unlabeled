@@ -4,7 +4,7 @@
 data:
   data_path: "data/dedup.phage_marker_rbp_with_phage_entropy.tsv"
   splits_path: "data/processed/splits.pkl"
-  embeddings_path: "data/processed/protein_embeddings.h5"
+  embeddings_path: "data/embeddings"
   output_dir: "outputs"
   checkpoint_dir: "checkpoints"
 
