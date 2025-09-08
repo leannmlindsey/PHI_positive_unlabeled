@@ -45,6 +45,12 @@ class NoisyORLayer(nn.Module):
         """
         # Apply mask if provided
         if mask is not None:
+            # Ensure mask has same shape as pairwise_probs
+            assert mask.shape == pairwise_probs.shape, \
+                f"Mask shape {mask.shape} doesn't match pairwise_probs shape {pairwise_probs.shape}"
+            # Convert to float if needed
+            if mask.dtype != torch.float32:
+                mask = mask.float()
             # Set masked positions to 0 (so 1-p becomes 1)
             pairwise_probs = pairwise_probs * mask
             
@@ -135,14 +141,35 @@ class MILModel(nn.Module):
         Args:
             encoded_markers: Encoded marker proteins (B, n_markers, d)
             encoded_rbps: Encoded RBP proteins (B, n_rbps, d)
-            marker_mask: Mask for markers (B, n_markers)
-            rbp_mask: Mask for RBPs (B, n_rbps)
+            marker_mask: Mask for markers (B, n_markers) or (n_markers,)
+            rbp_mask: Mask for RBPs (B, n_rbps) or (n_rbps,)
             
         Returns:
             Tuple of (scores, mask)
             - scores: Pairwise scores (B, n_markers, n_rbps)
             - mask: Combined mask (B, n_markers, n_rbps)
         """
+        # Ensure proper dimensions for masks
+        if marker_mask is not None:
+            # Convert to float for multiplication
+            marker_mask = marker_mask.float()
+            # Add batch dimension if missing
+            if marker_mask.dim() == 1:
+                marker_mask = marker_mask.unsqueeze(0)
+            # Ensure batch size matches
+            if marker_mask.size(0) == 1 and encoded_markers.size(0) > 1:
+                marker_mask = marker_mask.expand(encoded_markers.size(0), -1)
+        
+        if rbp_mask is not None:
+            # Convert to float for multiplication
+            rbp_mask = rbp_mask.float()
+            # Add batch dimension if missing
+            if rbp_mask.dim() == 1:
+                rbp_mask = rbp_mask.unsqueeze(0)
+            # Ensure batch size matches
+            if rbp_mask.size(0) == 1 and encoded_rbps.size(0) > 1:
+                rbp_mask = rbp_mask.expand(encoded_rbps.size(0), -1)
+        
         # Compute scaled dot product
         # (B, n_markers, d) @ (B, d, n_rbps) -> (B, n_markers, n_rbps)
         scores = torch.bmm(encoded_markers, encoded_rbps.transpose(1, 2))
@@ -153,16 +180,22 @@ class MILModel(nn.Module):
         # Apply temperature scaling
         scores = scores * self.temperature
         
-        # Create combined mask
+        # Create combined mask with proper shape checking
         if marker_mask is not None and rbp_mask is not None:
+            # Ensure masks have compatible shapes
+            assert marker_mask.size(0) == rbp_mask.size(0), \
+                f"Batch size mismatch: marker_mask {marker_mask.shape} vs rbp_mask {rbp_mask.shape}"
             # Expand masks and multiply
             # (B, n_markers, 1) * (B, 1, n_rbps) -> (B, n_markers, n_rbps)
             mask = marker_mask.unsqueeze(2) * rbp_mask.unsqueeze(1)
         elif marker_mask is not None:
-            mask = marker_mask.unsqueeze(2)
+            # Only marker mask available
+            mask = marker_mask.unsqueeze(2).expand(-1, -1, scores.size(2))
         elif rbp_mask is not None:
-            mask = rbp_mask.unsqueeze(1)
+            # Only RBP mask available
+            mask = rbp_mask.unsqueeze(1).expand(-1, scores.size(1), -1)
         else:
+            # No masks provided
             mask = None
             
         return scores, mask

@@ -25,16 +25,53 @@ class SimpleDataSplitter:
         self.df = pd.read_csv(data_path, sep='\t')
         print(f"Loaded {len(self.df)} interactions")
         
+        # Validate data integrity
+        self.validate_data()
+    
+    def validate_data(self):
+        """Validate data integrity and report any issues"""
+        print("\nValidating data integrity...")
+        
+        # Check for missing values
+        missing_rbps = self.df['rbp_md5'].isna().sum()
+        missing_markers = self.df['marker_md5'].isna().sum()
+        
+        if missing_rbps > 0:
+            print(f"  WARNING: {missing_rbps} rows have missing RBP hashes")
+        if missing_markers > 0:
+            print(f"  WARNING: {missing_markers} rows have missing marker hashes")
+        
+        # Check for empty strings
+        empty_rbps = (self.df['rbp_md5'].astype(str) == '').sum()
+        empty_markers = (self.df['marker_md5'].astype(str) == '').sum()
+        
+        if empty_rbps > 0:
+            print(f"  WARNING: {empty_rbps} rows have empty RBP hashes")
+        if empty_markers > 0:
+            print(f"  WARNING: {empty_markers} rows have empty marker hashes")
+        
+        # Report data statistics
+        print(f"  Total valid samples: {len(self.df) - max(missing_rbps, missing_markers)}")
+        
     def parse_rbps(self, indices: List[int]) -> Set[str]:
         """Extract all unique RBP hashes from given sample indices"""
         rbp_hashes = set()
         for idx in indices:
             row = self.df.iloc[idx]
+            rbp_field = str(row['rbp_md5'])
+            
+            # Skip if NaN or empty
+            if pd.isna(row['rbp_md5']) or rbp_field == 'nan' or not rbp_field:
+                continue
+                
             # Handle both single and multiple RBPs
-            if ',' in str(row['rbp_md5']):
-                rbp_hashes.update(row['rbp_md5'].split(','))
+            if ',' in rbp_field:
+                rbps = [rbp.strip() for rbp in rbp_field.split(',') if rbp.strip()]
+                rbp_hashes.update(rbps)
             else:
-                rbp_hashes.add(row['rbp_md5'])
+                rbp_field = rbp_field.strip()
+                if rbp_field:
+                    rbp_hashes.add(rbp_field)
         return rbp_hashes
     
     def parse_markers(self, indices: List[int]) -> Set[str]:
@@ -42,17 +79,39 @@ class SimpleDataSplitter:
         marker_hashes = set()
         for idx in indices:
             row = self.df.iloc[idx]
+            marker_field = str(row['marker_md5'])
+            
+            # Skip if NaN or empty
+            if pd.isna(row['marker_md5']) or marker_field == 'nan' or not marker_field:
+                continue
+                
             # Handle both single and multiple markers
-            if ',' in str(row['marker_md5']):
-                marker_hashes.update(row['marker_md5'].split(','))
+            if ',' in marker_field:
+                markers = [m.strip() for m in marker_field.split(',') if m.strip()]
+                marker_hashes.update(markers)
             else:
-                marker_hashes.add(row['marker_md5'])
+                marker_field = marker_field.strip()
+                if marker_field:
+                    marker_hashes.add(marker_field)
         return marker_hashes
     
     def has_rbp_overlap(self, sample_idx: int, train_rbps: Set[str]) -> bool:
         """Check if a sample contains any RBPs that are in the training set"""
         row = self.df.iloc[sample_idx]
-        sample_rbps = row['rbp_md5'].split(',') if ',' in str(row['rbp_md5']) else [row['rbp_md5']]
+        rbp_field = str(row['rbp_md5'])
+        
+        # Return False if NaN or empty
+        if pd.isna(row['rbp_md5']) or rbp_field == 'nan' or not rbp_field:
+            return False
+        
+        # Parse RBPs with proper cleaning
+        if ',' in rbp_field:
+            sample_rbps = [rbp.strip() for rbp in rbp_field.split(',') if rbp.strip()]
+        else:
+            rbp_field = rbp_field.strip()
+            sample_rbps = [rbp_field] if rbp_field else []
+        
+        # Check for overlap
         return any(rbp in train_rbps for rbp in sample_rbps)
     
     def split_data(self, train_ratio: float = 0.6, val_ratio: float = 0.2) -> Tuple[List[int], List[int], List[int]]:

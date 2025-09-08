@@ -16,16 +16,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, ReduceLROnPlateau, LambdaLR, OneCycleLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
+import math
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
 from models.mil_model import MILModel
 from models.losses import nnPULoss
+from models.calibration import TemperatureScaling, PlattScaling
 from training.dataset import PhageHostDataModule
 from utils.logging_utils import setup_logger, MetricLogger, log_model_info, log_training_config
 from training.evaluation import evaluate_model, compute_metrics
@@ -180,19 +182,83 @@ class Trainer:
         
         if scheduler_name == 'none':
             return None
+            
         elif scheduler_name == 'cosine':
             return CosineAnnealingLR(
                 self.optimizer,
                 T_max=self.config['training']['scheduler_params']['T_max'],
                 eta_min=self.config['training']['scheduler_params']['eta_min']
             )
+            
+        elif scheduler_name == 'warmup_cosine':
+            # Warmup + Cosine Annealing (recommended for PU learning)
+            warmup_steps = self.config['training']['scheduler_params'].get('warmup_steps', 1000)
+            warmup_epochs = self.config['training']['scheduler_params'].get('warmup_epochs', 5)
+            
+            # Calculate total steps accounting for gradient accumulation
+            accumulation_steps = self.config['training'].get('gradient_accumulation_steps', 1)
+            steps_per_epoch = len(self.data_module.train_dataloader()) // accumulation_steps
+            total_steps = self.config['training']['num_epochs'] * steps_per_epoch
+            
+            # Use warmup_epochs if warmup_steps not specified
+            if 'warmup_steps' not in self.config['training']['scheduler_params']:
+                warmup_steps = warmup_epochs * steps_per_epoch
+            
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    # Linear warmup
+                    return step / warmup_steps
+                # Cosine annealing after warmup
+                progress = (step - warmup_steps) / (total_steps - warmup_steps)
+                return 0.5 * (1 + math.cos(math.pi * progress))
+            
+            scheduler = LambdaLR(self.optimizer, lr_lambda)
+            self.logger.info(f"Using warmup_cosine scheduler: {warmup_steps} warmup steps, {total_steps} total steps")
+            return scheduler
+            
+        elif scheduler_name == 'onecycle':
+            # One Cycle scheduler (good for finding optimal LR)
+            accumulation_steps = self.config['training'].get('gradient_accumulation_steps', 1)
+            steps_per_epoch = len(self.data_module.train_dataloader()) // accumulation_steps
+            return OneCycleLR(
+                self.optimizer,
+                max_lr=self.config['training']['learning_rate'] * 10,  # Peak LR
+                epochs=self.config['training']['num_epochs'],
+                steps_per_epoch=steps_per_epoch,
+                pct_start=self.config['training']['scheduler_params'].get('pct_start', 0.3),
+                anneal_strategy=self.config['training']['scheduler_params'].get('anneal_strategy', 'cos'),
+                div_factor=self.config['training']['scheduler_params'].get('div_factor', 25.0),
+                final_div_factor=self.config['training']['scheduler_params'].get('final_div_factor', 10000.0)
+            )
+            
+        elif scheduler_name == 'exponential':
+            # Exponential decay (smooth alternative to step)
+            from torch.optim.lr_scheduler import ExponentialLR
+            return ExponentialLR(
+                self.optimizer,
+                gamma=self.config['training']['scheduler_params'].get('gamma', 0.95)
+            )
+            
+        elif scheduler_name == 'polynomial':
+            # Polynomial decay (used in BERT)
+            total_steps = self.config['training']['num_epochs'] * len(self.data_module.train_dataloader())
+            power = self.config['training']['scheduler_params'].get('power', 1.0)
+            
+            def lr_lambda(step):
+                return (1 - step / total_steps) ** power
+                
+            return LambdaLR(self.optimizer, lr_lambda)
+            
         elif scheduler_name == 'step':
             return StepLR(
                 self.optimizer,
                 step_size=self.config['training']['scheduler_params']['step_size'],
                 gamma=self.config['training']['scheduler_params']['gamma']
             )
+            
         elif scheduler_name == 'plateau':
+            # Not recommended for noisy PU learning, but kept for compatibility
+            self.logger.warning("Plateau scheduler may not work well with noisy PU learning. Consider 'warmup_cosine' instead.")
             return ReduceLROnPlateau(
                 self.optimizer,
                 mode='max' if self._is_metric_higher_better() else 'min',
@@ -236,6 +302,13 @@ class Trainer:
         
         train_loader = self.data_module.train_dataloader()
         
+        # Gradient accumulation settings
+        accumulation_steps = self.config['training'].get('gradient_accumulation_steps', 1)
+        effective_batch_size = self.config['training']['batch_size'] * accumulation_steps
+        
+        # Zero gradients at start
+        self.optimizer.zero_grad()
+        
         with tqdm(train_loader, desc=f"Epoch {epoch+1} Training") as pbar:
             for batch_idx, batch in enumerate(pbar):
                 # Move batch to device
@@ -244,9 +317,6 @@ class Trainer:
                 marker_mask = batch['marker_mask'].to(self.device)
                 rbp_mask = batch['rbp_mask'].to(self.device)
                 labels = batch['label'].to(self.device)
-                
-                # Zero gradients
-                self.optimizer.zero_grad()
                 
                 # Forward pass
                 outputs = self.model(
@@ -258,41 +328,69 @@ class Trainer:
                 
                 # Compute loss
                 loss_dict = self.criterion(outputs['bag_probs'], labels)
-                loss = loss_dict['loss']
                 
-                # Backward pass
+                # Scale loss by accumulation steps to maintain effective learning rate
+                loss = loss_dict['loss'] / accumulation_steps
+                
+                # Backward pass (accumulate gradients)
                 loss.backward()
                 
-                # Gradient clipping
-                if self.config['training']['gradient_clip'] > 0:
-                    nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config['training']['gradient_clip']
-                    )
+                # Perform optimizer step every accumulation_steps batches
+                if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                    # Gradient clipping (applied to accumulated gradients)
+                    if self.config['training']['gradient_clip'] > 0:
+                        nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.config['training']['gradient_clip']
+                        )
+                    
+                    # Optimizer step
+                    self.optimizer.step()
+                    
+                    # Zero gradients for next accumulation
+                    self.optimizer.zero_grad()
                 
-                # Optimizer step
-                self.optimizer.step()
+                # Update per-batch schedulers (only after optimizer step)
+                if self.scheduler and ((batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader)):
+                    if isinstance(self.scheduler, OneCycleLR):
+                        # OneCycle scheduler steps per optimizer step
+                        self.scheduler.step()
+                    elif isinstance(self.scheduler, LambdaLR) and self.config['training']['scheduler'] == 'warmup_cosine':
+                        # Warmup cosine also steps per optimizer step for smooth warmup
+                        self.scheduler.step()
                 
-                # Update metrics
+                # Update metrics (use unscaled loss for accurate tracking)
                 batch_size = labels.size(0)
-                total_loss += loss.item() * batch_size
+                unscaled_loss = loss_dict['loss'].item()
+                total_loss += unscaled_loss * batch_size
                 total_positive_risk += loss_dict['positive_risk'].item() * batch_size
                 total_negative_risk += loss_dict['negative_risk'].item() * batch_size
                 total_samples += batch_size
                 
+                # Get current learning rate
+                current_lr = self.optimizer.param_groups[0]['lr']
+                
+                # Calculate effective batch info for display
+                accumulated_batches = min((batch_idx % accumulation_steps) + 1, accumulation_steps)
+                effective_samples = accumulated_batches * batch_size
+                
                 # Update progress bar
                 pbar.set_postfix({
-                    'loss': loss.item(),
+                    'loss': unscaled_loss,
                     'pos_risk': loss_dict['positive_risk'].item(),
-                    'neg_risk': loss_dict['negative_risk'].item()
+                    'neg_risk': loss_dict['negative_risk'].item(),
+                    'lr': current_lr,
+                    'acc_steps': f"{accumulated_batches}/{accumulation_steps}"
                 })
                 
                 # Log to wandb
                 if self.config['logging']['use_wandb'] and batch_idx % self.config['logging']['log_every_n_batches'] == 0:
                     wandb.log({
-                        'train/batch_loss': loss.item(),
+                        'train/batch_loss': unscaled_loss,
                         'train/batch_positive_risk': loss_dict['positive_risk'].item(),
                         'train/batch_negative_risk': loss_dict['negative_risk'].item(),
+                        'train/learning_rate': current_lr,
+                        'train/effective_batch_size': effective_samples,
                         'train/step': epoch * len(train_loader) + batch_idx
                     })
         
@@ -495,8 +593,23 @@ class Trainer:
             # Update scheduler
             if self.scheduler:
                 if isinstance(self.scheduler, ReduceLROnPlateau):
-                    self.scheduler.step(val_metrics.get('auroc', train_metrics['loss']))
+                    # Plateau scheduler needs a metric to track
+                    metric_value = val_metrics.get('auroc', train_metrics['loss']) if val_metrics else train_metrics['loss']
+                    self.scheduler.step(metric_value)
+                elif isinstance(self.scheduler, OneCycleLR):
+                    # OneCycle scheduler is stepped per batch, not per epoch
+                    # (handled in train_epoch method)
+                    pass
+                elif isinstance(self.scheduler, LambdaLR):
+                    # LambdaLR schedulers (warmup_cosine, polynomial) track total steps
+                    # Need to update them per batch or per epoch depending on configuration
+                    if self.config['training']['scheduler'] == 'warmup_cosine':
+                        # Warmup cosine is stepped per batch (handled in train_epoch)
+                        pass
+                    else:
+                        self.scheduler.step()
                 else:
+                    # Standard schedulers (cosine, step, exponential) - step per epoch
                     self.scheduler.step()
                     
             # Early stopping
@@ -506,6 +619,135 @@ class Trainer:
                     break
                     
         self.logger.info("Training completed!")
+        
+        # Calibrate model if enabled
+        if self.config['training'].get('calibrate_model', False):
+            self.calibrate_model()
+        
+    def calibrate_model(self):
+        """
+        Calibrate the trained model using temperature scaling
+        """
+        self.logger.info("Calibrating model...")
+        
+        # Load best checkpoint
+        best_checkpoint_path = Path(self.config['data']['checkpoint_dir']) / 'best_model.pt'
+        if best_checkpoint_path.exists():
+            checkpoint = torch.load(best_checkpoint_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.logger.info(f"Loaded best model from {best_checkpoint_path}")
+        
+        # Get validation loader
+        val_loader = self.data_module.val_dataloader()
+        
+        # Apply temperature scaling
+        calibration_method = self.config['training'].get('calibration_method', 'temperature')
+        
+        if calibration_method == 'temperature':
+            # Create temperature-scaled model
+            self.calibrated_model = TemperatureScaling(
+                self.model,
+                device=self.device,
+                logger=self.logger
+            )
+            
+            # Optimize temperature on validation set
+            optimal_temp = self.calibrated_model.optimize_temperature(
+                val_loader,
+                criterion=nn.BCELoss(),
+                max_iter=self.config['training'].get('calibration_max_iter', 50),
+                lr=self.config['training'].get('calibration_lr', 0.01)
+            )
+            
+            self.logger.info(f"Optimal temperature: {optimal_temp:.4f}")
+            
+        elif calibration_method == 'platt':
+            # Create Platt-scaled model
+            self.calibrated_model = PlattScaling(
+                self.model,
+                device=self.device,
+                logger=self.logger
+            )
+            
+            # Optimize Platt scaling parameters
+            scale, bias = self.calibrated_model.optimize_parameters(
+                val_loader,
+                max_iter=self.config['training'].get('calibration_max_iter', 100),
+                lr=self.config['training'].get('calibration_lr', 0.01)
+            )
+            
+            self.logger.info(f"Platt scaling - Scale: {scale:.4f}, Bias: {bias:.4f}")
+        else:
+            self.logger.warning(f"Unknown calibration method: {calibration_method}")
+            self.calibrated_model = self.model
+        
+        # Save calibrated model
+        self.save_calibrated_model()
+        
+        # Evaluate calibrated model
+        self.logger.info("Evaluating calibrated model...")
+        cal_metrics = self.evaluate_calibrated_model(val_loader)
+        self.logger.info(f"Calibrated model metrics: {cal_metrics}")
+        
+    def save_calibrated_model(self):
+        """Save the calibrated model"""
+        checkpoint_dir = Path(self.config['data']['checkpoint_dir'])
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        calibrated_path = checkpoint_dir / 'calibrated_model.pt'
+        
+        # Save calibrated model state
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'calibration_type': self.config['training'].get('calibration_method', 'temperature'),
+            'calibration_params': {
+                'temperature': self.calibrated_model.get_temperature() if hasattr(self.calibrated_model, 'get_temperature') else 1.0
+            },
+            'config': self.config
+        }, calibrated_path)
+        
+        self.logger.info(f"Saved calibrated model to {calibrated_path}")
+    
+    def evaluate_calibrated_model(self, loader: DataLoader) -> Dict[str, float]:
+        """
+        Evaluate calibrated model and return calibration metrics
+        """
+        all_probs = []
+        all_labels = []
+        
+        self.calibrated_model.eval()
+        
+        with torch.no_grad():
+            for batch in tqdm(loader, desc="Evaluating calibration"):
+                # Move batch to device
+                marker_embeddings = batch['marker_embeddings'].to(self.device)
+                rbp_embeddings = batch['rbp_embeddings'].to(self.device)
+                marker_mask = batch['marker_mask'].to(self.device)
+                rbp_mask = batch['rbp_mask'].to(self.device)
+                labels = batch['label'].to(self.device)
+                
+                # Get calibrated predictions
+                outputs = self.calibrated_model(
+                    marker_embeddings,
+                    rbp_embeddings,
+                    marker_mask,
+                    rbp_mask
+                )
+                
+                all_probs.extend(outputs['bag_probs'].cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        
+        # Calculate calibration metrics
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
+        
+        # ECE and MCE
+        calibration_metrics = self.calibrated_model.calculate_calibration_metrics(
+            torch.tensor(all_probs),
+            torch.tensor(all_labels)
+        )
+        
+        return calibration_metrics
         
     def test(self):
         """

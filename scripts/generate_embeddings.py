@@ -94,7 +94,7 @@ class ESM2Embedder:
     
     def embed_batch(self, sequences: list) -> np.ndarray:
         """
-        Generate embeddings for a batch of sequences
+        Generate embeddings for a batch of sequences with adaptive batching
         
         Args:
             sequences: List of (label, sequence) tuples
@@ -102,16 +102,77 @@ class ESM2Embedder:
         Returns:
             Array of embeddings
         """
-        # Check if batch would be too large
-        max_seq_len = max(len(seq) for _, seq in sequences)
-        estimated_memory_gb = (len(sequences) * max_seq_len * max_seq_len * 4) / (1024**3)
+        # Sort sequences by length for better memory estimation
+        sequences = sorted(sequences, key=lambda x: len(x[1]))
+        max_seq_len = len(sequences[-1][1])
         
-        # If estimated memory > 40GB, process sequences individually
-        if estimated_memory_gb > 40:
-            self.logger.warning(f"Batch too large ({estimated_memory_gb:.1f}GB), processing individually")
+        # Very conservative memory estimation for safety
+        # Each sequence needs roughly max_seq_len^2 * 4 bytes per attention layer
+        safe_batch_size = 1
+        if max_seq_len < 500:
+            safe_batch_size = 8
+        elif max_seq_len < 1000:
+            safe_batch_size = 4
+        elif max_seq_len < 2000:
+            safe_batch_size = 2
+        elif max_seq_len < 5000:
+            safe_batch_size = 1
+        
+        # Process in smaller batches if needed
+        if len(sequences) > safe_batch_size:
+            self.logger.info(f"Processing {len(sequences)} sequences in batches of {safe_batch_size} (max_len={max_seq_len})")
+            all_embeddings = []
+            
+            for i in range(0, len(sequences), safe_batch_size):
+                batch = sequences[i:i+safe_batch_size]
+                try:
+                    # Recursively process smaller batch
+                    batch_emb = self.embed_batch(batch)
+                    all_embeddings.extend(batch_emb)
+                except torch.cuda.OutOfMemoryError:
+                    # If even smaller batch fails, process individually
+                    self.logger.warning(f"Batch of {len(batch)} failed, processing individually")
+                    for seq in batch:
+                        emb = self.embed_batch([seq])
+                        all_embeddings.extend(emb)
+                
+                # Clear cache between batches
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
+            return np.array(all_embeddings)
+        
+        # Try to process the batch
+        try:
+            batch_labels, batch_strs, batch_tokens = self.batch_converter(sequences)
+            batch_tokens = batch_tokens.to(self.device)
+            
+            with torch.no_grad():
+                results = self.model(batch_tokens, repr_layers=[33], return_contacts=False)
+                token_embeddings = results["representations"][33]
+            
+            # Extract embeddings and apply mean pooling
             embeddings = []
+            for i, (_, seq) in enumerate(sequences):
+                seq_len = len(seq)
+                # Remove BOS/EOS tokens and mean pool
+                seq_embeddings = token_embeddings[i, 1:seq_len+1]
+                pooled = seq_embeddings.mean(dim=0)
+                embeddings.append(pooled.cpu().numpy())
+            
+            return np.array(embeddings)
+            
+        except torch.cuda.OutOfMemoryError as e:
+            # If batch processing fails, fall back to individual processing
+            self.logger.warning(f"Batch processing failed with OOM, processing {len(sequences)} sequences individually")
+            embeddings = []
+            
             for label, seq in sequences:
                 try:
+                    # Clear cache before each sequence
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
                     # Process single sequence
                     single_batch = [(label, seq)]
                     batch_labels, batch_strs, batch_tokens = self.batch_converter(single_batch)
@@ -127,35 +188,12 @@ class ESM2Embedder:
                     pooled = seq_embeddings.mean(dim=0)
                     embeddings.append(pooled.cpu().numpy())
                     
-                    # Clear cache after each sequence
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        
-                except Exception as e:
-                    self.logger.error(f"Failed to process sequence of length {len(seq)}: {e}")
+                except Exception as e2:
+                    self.logger.error(f"Failed to process sequence of length {len(seq)}: {e2}")
                     # Return zero embedding for failed sequences
                     embeddings.append(np.zeros(self.embed_dim))
                     
             return np.array(embeddings)
-        
-        # Normal batch processing for smaller batches
-        batch_labels, batch_strs, batch_tokens = self.batch_converter(sequences)
-        batch_tokens = batch_tokens.to(self.device)
-        
-        with torch.no_grad():
-            results = self.model(batch_tokens, repr_layers=[33], return_contacts=False)
-            token_embeddings = results["representations"][33]
-        
-        # Extract embeddings and apply mean pooling
-        embeddings = []
-        for i, (_, seq) in enumerate(sequences):
-            seq_len = len(seq)
-            # Remove BOS/EOS tokens and mean pool
-            seq_embeddings = token_embeddings[i, 1:seq_len+1]
-            pooled = seq_embeddings.mean(dim=0)
-            embeddings.append(pooled.cpu().numpy())
-        
-        return np.array(embeddings)
     
     def process_sequences(self, sequences: Dict[str, str], output_path: str, 
                          desc: str = "Processing", resume: bool = True):
@@ -191,9 +229,38 @@ class ESM2Embedder:
         
         self.logger.info(f"Processing {len(to_process)} sequences")
         
-        # Prepare batches
-        hash_list = list(to_process.keys())
-        seq_list = list(to_process.values())
+        # Sort sequences by length for efficient batching
+        # This ensures similar-length sequences are processed together
+        seq_with_hash = [(hash_val, seq, len(seq)) for hash_val, seq in to_process.items()]
+        seq_with_hash.sort(key=lambda x: x[2])  # Sort by sequence length
+        
+        # Group sequences by length buckets for optimal memory usage
+        length_buckets = []
+        current_bucket = []
+        current_max_len = 0
+        
+        for hash_val, seq, seq_len in seq_with_hash:
+            # Start new bucket if length difference is too large
+            if current_bucket and (seq_len > current_max_len * 1.5 or seq_len > current_max_len + 500):
+                length_buckets.append(current_bucket)
+                current_bucket = []
+                current_max_len = 0
+            
+            current_bucket.append((hash_val, seq))
+            current_max_len = max(current_max_len, seq_len)
+        
+        if current_bucket:
+            length_buckets.append(current_bucket)
+        
+        self.logger.info(f"Organized sequences into {len(length_buckets)} length-based buckets")
+        
+        # Flatten buckets back for processing but maintain length ordering
+        sorted_data = []
+        for bucket in length_buckets:
+            sorted_data.extend(bucket)
+        
+        hash_list = [item[0] for item in sorted_data]
+        seq_list = [item[1] for item in sorted_data]
         
         # Open HDF5 file
         mode = 'a' if resume and output_path.exists() else 'w'
@@ -217,13 +284,34 @@ class ESM2Embedder:
                 embeddings_ds = f['embeddings']
                 hashes_ds = f['hashes']
             
-            # Process in batches
-            for i in tqdm(range(0, len(hash_list), self.batch_size), 
-                         desc=desc, 
-                         total=(len(hash_list) + self.batch_size - 1) // self.batch_size):
+            # Process in batches with dynamic batch sizing based on sequence lengths
+            processed = 0
+            pbar = tqdm(total=len(hash_list), desc=desc)
+            
+            i = 0
+            while i < len(hash_list):
+                # Determine adaptive batch size based on sequence lengths
+                max_len_in_batch = len(seq_list[i])
                 
-                batch_hashes = hash_list[i:i + self.batch_size]
-                batch_seqs = seq_list[i:i + self.batch_size]
+                # Adjust batch size based on max length
+                if max_len_in_batch < 500:
+                    adaptive_batch_size = min(self.batch_size * 2, 16)  # Can handle more short sequences
+                elif max_len_in_batch < 1000:
+                    adaptive_batch_size = self.batch_size
+                elif max_len_in_batch < 2000:
+                    adaptive_batch_size = max(self.batch_size // 2, 2)
+                else:
+                    adaptive_batch_size = 1  # Process very long sequences individually
+                
+                # Get batch
+                end_idx = min(i + adaptive_batch_size, len(hash_list))
+                batch_hashes = hash_list[i:end_idx]
+                batch_seqs = seq_list[i:end_idx]
+                
+                # Log batch info for very long sequences
+                max_batch_len = max(len(seq) for seq in batch_seqs)
+                if max_batch_len > 3000:
+                    self.logger.info(f"Processing batch with {len(batch_seqs)} sequences, max length: {max_batch_len}")
                 
                 # Prepare sequences with labels
                 labeled_seqs = [(f"seq_{j}", seq) for j, seq in enumerate(batch_seqs)]
@@ -244,12 +332,25 @@ class ESM2Embedder:
                     hashes_ds[current_size:new_size] = batch_hashes
                     
                     # Flush periodically
-                    if (i + self.batch_size) % (self.batch_size * 10) == 0:
+                    if processed % 100 == 0:
                         f.flush()
+                    
+                    # Update progress
+                    pbar.update(len(batch_hashes))
+                    processed += len(batch_hashes)
+                    
+                    # Move to next batch
+                    i = end_idx
                         
                 except Exception as e:
                     self.logger.error(f"Error processing batch at index {i}: {e}")
                     raise
+                finally:
+                    # Clear GPU cache after each batch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            
+            pbar.close()
         
         self.logger.info(f"Embeddings saved to {output_path}")
 

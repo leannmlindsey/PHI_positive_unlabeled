@@ -46,9 +46,13 @@ class nnPULoss(nn.Module):
         self.epsilon = epsilon
         
         # Logging
-        logger = logging.getLogger(__name__)
-        logger.info(f"nnPULoss initialized with prior={prior}, beta={beta}, "
-                   f"gamma={gamma}, loss_type={loss_type}")
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"nnPULoss initialized with prior={prior}, beta={beta}, "
+                        f"gamma={gamma}, loss_type={loss_type}")
+        
+        # Track statistics for monitoring
+        self.negative_risk_corrections = 0
+        self.total_forward_calls = 0
         
     def _sigmoid_loss(self, outputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -153,18 +157,40 @@ class nnPULoss(nn.Module):
             unlabeled_losses = loss_func(unlabeled_outputs, -torch.ones_like(unlabeled_outputs))
             unlabeled_risk = unlabeled_losses.mean()
             
-        # Compute negative risk with correction
-        # R_n = R_u - π * R_n^+
-        negative_risk = unlabeled_risk - self.prior * positive_negative_risk
+        # Compute negative risk with better edge case handling
+        if n_positive > 0 and n_unlabeled > 0:
+            # Standard case: have both positive and unlabeled samples
+            # R_n = R_u - π * R_n^+
+            negative_risk = unlabeled_risk - self.prior * positive_negative_risk
+        elif n_unlabeled > 0:
+            # Edge case: no positive samples, use unlabeled risk directly
+            # This can happen in small batches or during early training
+            negative_risk = unlabeled_risk
+        else:
+            # Edge case: no unlabeled samples
+            negative_risk = torch.tensor(0.0, device=outputs.device)
         
-        # Apply non-negative correction
+        # Apply non-negative correction with improved logic
         if negative_risk < 0:
-            # Use γ to control the strength of correction
-            negative_risk = self.gamma * negative_risk
-            # Alternative: negative_risk = -self.beta * negative_risk
-            
-        # Ensure non-negative
+            self.negative_risk_corrections += 1
+            if self.gamma > 0:
+                # Apply gamma correction (absolute value scaled by gamma)
+                # This allows some negative risk but penalizes it
+                negative_risk = torch.abs(negative_risk) * self.gamma
+            else:
+                # Hard clipping to zero
+                negative_risk = torch.tensor(0.0, device=outputs.device)
+        
+        # Final safety check to ensure non-negative
         negative_risk = torch.max(negative_risk, torch.tensor(0.0, device=outputs.device))
+        
+        # Update statistics
+        self.total_forward_calls += 1
+        if self.total_forward_calls % 100 == 0:
+            correction_rate = self.negative_risk_corrections / self.total_forward_calls
+            if correction_rate > 0.5:
+                self.logger.warning(f"High negative risk correction rate: {correction_rate:.2%}. "
+                                  f"Consider adjusting prior (current: {self.prior})")
         
         # Total risk
         # R = π * R_p^+ + R_n

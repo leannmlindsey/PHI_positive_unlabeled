@@ -10,47 +10,207 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 import logging
 import hashlib
+from collections import OrderedDict
+import atexit
 
 
-class EmbeddingLoader:
+class LazyEmbeddingLoader:
     """
-    Loads and manages protein embeddings from HDF5 file
+    Lazily loads protein embeddings from HDF5 file with LRU caching
+    """
+    
+    def __init__(self, 
+                 embedding_path: str, 
+                 cache_size: int = 10000,
+                 preload_all: bool = False,
+                 logger: Optional[logging.Logger] = None):
+        """
+        Initialize the lazy embedding loader
+        
+        Args:
+            embedding_path: Path to HDF5 file with embeddings
+            cache_size: Maximum number of embeddings to cache in memory
+            preload_all: If True, loads all embeddings into memory (like original behavior)
+            logger: Optional logger instance
+        """
+        self.embedding_path = Path(embedding_path)
+        self.cache_size = cache_size
+        self.preload_all = preload_all
+        self.logger = logger or logging.getLogger(__name__)
+        
+        # LRU cache using OrderedDict
+        self._cache = OrderedDict()
+        self._file = None
+        self._hash_to_idx = {}
+        self.embedding_dim = None
+        self.total_embeddings = 0
+        
+        # Initialize the loader
+        self._initialize()
+        
+        # Register cleanup on exit
+        atexit.register(self._cleanup)
+        
+    def _initialize(self) -> None:
+        """Initialize the loader and build hash-to-index mapping"""
+        if not self.embedding_path.exists():
+            raise FileNotFoundError(f"Embedding file not found: {self.embedding_path}")
+        
+        self.logger.info(f"Initializing lazy loader for {self.embedding_path}")
+        
+        # Open file and build index
+        with h5py.File(self.embedding_path, 'r') as h5f:
+            hashes_array = h5f['hashes'][:]
+            embeddings_shape = h5f['embeddings'].shape
+            
+            self.embedding_dim = embeddings_shape[1]
+            self.total_embeddings = embeddings_shape[0]
+            
+            # Build hash to index mapping
+            for i, hash_val in enumerate(hashes_array):
+                if isinstance(hash_val, bytes):
+                    hash_val = hash_val.decode('utf-8')
+                self._hash_to_idx[hash_val] = i
+                
+        self.logger.info(f"Initialized with {self.total_embeddings} embeddings, "
+                        f"dimension {self.embedding_dim}, cache size {self.cache_size}")
+        
+        # Preload all if requested
+        if self.preload_all:
+            self._preload_all_embeddings()
+    
+    def _preload_all_embeddings(self) -> None:
+        """Preload all embeddings into cache (for compatibility with original behavior)"""
+        self.logger.info("Preloading all embeddings into memory...")
+        
+        with h5py.File(self.embedding_path, 'r') as h5f:
+            embeddings_array = h5f['embeddings'][:]
+            
+            for hash_val, idx in self._hash_to_idx.items():
+                self._cache[hash_val] = embeddings_array[idx]
+        
+        self.logger.info(f"Preloaded {len(self._cache)} embeddings")
+    
+    def _open_file(self) -> None:
+        """Open the HDF5 file if not already open"""
+        if self._file is None:
+            self._file = h5py.File(self.embedding_path, 'r')
+    
+    def _cleanup(self) -> None:
+        """Clean up resources"""
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+    
+    def get_embedding(self, protein_hash: str) -> np.ndarray:
+        """
+        Get embedding for a protein by its MD5 hash
+        
+        Args:
+            protein_hash: MD5 hash of the protein sequence
+            
+        Returns:
+            Embedding array
+        """
+        # Check cache first
+        if protein_hash in self._cache:
+            # Move to end (most recently used)
+            self._cache.move_to_end(protein_hash)
+            return self._cache[protein_hash]
+        
+        # Check if hash exists
+        if protein_hash not in self._hash_to_idx:
+            raise KeyError(f"Embedding not found for hash: {protein_hash}")
+        
+        # Load from file
+        self._open_file()
+        idx = self._hash_to_idx[protein_hash]
+        embedding = self._file['embeddings'][idx][:]
+        
+        # Add to cache
+        self._add_to_cache(protein_hash, embedding)
+        
+        return embedding
+    
+    def _add_to_cache(self, hash_val: str, embedding: np.ndarray) -> None:
+        """Add embedding to cache with LRU eviction"""
+        # Check cache size
+        if len(self._cache) >= self.cache_size:
+            # Remove least recently used (first item)
+            self._cache.popitem(last=False)
+        
+        # Add new item (becomes most recently used)
+        self._cache[hash_val] = embedding
+    
+    def get_embeddings_batch(self, protein_hashes: List[str], use_zero_for_missing: bool = True) -> np.ndarray:
+        """
+        Get embeddings for multiple proteins with error handling
+        
+        Args:
+            protein_hashes: List of MD5 hashes
+            use_zero_for_missing: If True, use zero vectors for missing embeddings
+            
+        Returns:
+            Array of embeddings with shape (n_proteins, embedding_dim)
+        """
+        embeddings = []
+        missing_count = 0
+        
+        for hash_val in protein_hashes:
+            try:
+                embeddings.append(self.get_embedding(hash_val))
+            except KeyError:
+                if use_zero_for_missing:
+                    self.logger.warning(f"Missing embedding for hash {hash_val}, using zero vector")
+                    embeddings.append(np.zeros(self.embedding_dim))
+                    missing_count += 1
+                else:
+                    raise
+        
+        if missing_count > 0:
+            self.logger.warning(f"Total missing embeddings: {missing_count}/{len(protein_hashes)}")
+            
+        return np.stack(embeddings) if embeddings else np.zeros((0, self.embedding_dim))
+    
+    def cache_stats(self) -> Dict[str, int]:
+        """Get cache statistics"""
+        return {
+            'cache_size': len(self._cache),
+            'max_cache_size': self.cache_size,
+            'total_embeddings': self.total_embeddings,
+            'cache_hit_rate': len(self._cache) / self.total_embeddings if self.total_embeddings > 0 else 0
+        }
+    
+    def __del__(self):
+        """Cleanup on deletion"""
+        self._cleanup()
+
+
+# Keep original EmbeddingLoader for backward compatibility
+class EmbeddingLoader(LazyEmbeddingLoader):
+    """
+    Legacy embedding loader that loads all embeddings into memory
+    Kept for backward compatibility
     """
     
     def __init__(self, embedding_path: str, logger: Optional[logging.Logger] = None):
         """
-        Initialize the embedding loader
+        Initialize the embedding loader (loads all into memory)
         
         Args:
             embedding_path: Path to HDF5 file with embeddings
             logger: Optional logger instance
         """
-        self.embedding_path = Path(embedding_path)
-        self.logger = logger or logging.getLogger(__name__)
-        self.embeddings = {}
-        self.embedding_dim = None
-        self._load_embeddings()
+        # Use lazy loader with preload_all=True and unlimited cache
+        super().__init__(
+            embedding_path=embedding_path,
+            cache_size=float('inf'),  # Unlimited cache
+            preload_all=True,  # Load everything at init
+            logger=logger
+        )
         
-    def _load_embeddings(self) -> None:
-        """Load embeddings from HDF5 file into memory"""
-        if not self.embedding_path.exists():
-            raise FileNotFoundError(f"Embedding file not found: {self.embedding_path}")
-            
-        self.logger.info(f"Loading embeddings from {self.embedding_path}")
-        
-        with h5py.File(self.embedding_path, 'r') as h5f:
-            embeddings_array = h5f['embeddings'][:]
-            hashes_array = h5f['hashes'][:]
-            
-            # Create dictionary for fast lookup
-            for i, hash_val in enumerate(hashes_array):
-                if isinstance(hash_val, bytes):
-                    hash_val = hash_val.decode('utf-8')
-                self.embeddings[hash_val] = embeddings_array[i]
-                
-            self.embedding_dim = embeddings_array.shape[1]
-            
-        self.logger.info(f"Loaded {len(self.embeddings)} embeddings with dimension {self.embedding_dim}")
+        # For backward compatibility, expose embeddings dict
+        self.embeddings = self._cache
         
     def get_embedding(self, protein_hash: str) -> np.ndarray:
         """
@@ -66,20 +226,35 @@ class EmbeddingLoader:
             raise KeyError(f"Embedding not found for hash: {protein_hash}")
         return self.embeddings[protein_hash]
     
-    def get_embeddings_batch(self, protein_hashes: List[str]) -> np.ndarray:
+    def get_embeddings_batch(self, protein_hashes: List[str], use_zero_for_missing: bool = True) -> np.ndarray:
         """
-        Get embeddings for multiple proteins
+        Get embeddings for multiple proteins with error handling
         
         Args:
             protein_hashes: List of MD5 hashes
+            use_zero_for_missing: If True, use zero vectors for missing embeddings; if False, raise error
             
         Returns:
             Array of embeddings with shape (n_proteins, embedding_dim)
         """
         embeddings = []
+        missing_count = 0
+        
         for hash_val in protein_hashes:
-            embeddings.append(self.get_embedding(hash_val))
-        return np.stack(embeddings)
+            try:
+                embeddings.append(self.get_embedding(hash_val))
+            except KeyError:
+                if use_zero_for_missing:
+                    self.logger.warning(f"Missing embedding for hash {hash_val}, using zero vector")
+                    embeddings.append(np.zeros(self.embedding_dim))
+                    missing_count += 1
+                else:
+                    raise
+        
+        if missing_count > 0:
+            self.logger.warning(f"Total missing embeddings: {missing_count}/{len(protein_hashes)}")
+            
+        return np.stack(embeddings) if embeddings else np.zeros((0, self.embedding_dim))
 
 
 class MultiInstanceBag:
@@ -106,18 +281,29 @@ class MultiInstanceBag:
         self.phage_id = phage_id
         self.label = label
         
-    def get_embeddings(self, embedding_loader: EmbeddingLoader) -> Tuple[np.ndarray, np.ndarray]:
+    def get_embeddings(self, embedding_loader: EmbeddingLoader, use_zero_for_missing: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Get embeddings for all proteins in the bag
+        Get embeddings for all proteins in the bag with error handling
         
         Args:
             embedding_loader: EmbeddingLoader instance
+            use_zero_for_missing: If True, use zero vectors for missing embeddings
             
         Returns:
             Tuple of (marker_embeddings, rbp_embeddings)
+            
+        Raises:
+            ValueError: If no valid embeddings found for either markers or RBPs
         """
-        marker_embeddings = embedding_loader.get_embeddings_batch(self.marker_hashes)
-        rbp_embeddings = embedding_loader.get_embeddings_batch(self.rbp_hashes)
+        marker_embeddings = embedding_loader.get_embeddings_batch(self.marker_hashes, use_zero_for_missing)
+        rbp_embeddings = embedding_loader.get_embeddings_batch(self.rbp_hashes, use_zero_for_missing)
+        
+        # Validate we have at least some non-zero embeddings
+        if marker_embeddings.shape[0] == 0 or np.all(marker_embeddings == 0):
+            raise ValueError(f"No valid marker embeddings found for phage {self.phage_id}")
+        if rbp_embeddings.shape[0] == 0 or np.all(rbp_embeddings == 0):
+            raise ValueError(f"No valid RBP embeddings found for phage {self.phage_id}")
+            
         return marker_embeddings, rbp_embeddings
     
     def __repr__(self) -> str:

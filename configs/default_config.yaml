@@ -45,6 +45,9 @@ training:
   # Batch size
   batch_size: 32
   
+  # Gradient accumulation steps (effective batch size = batch_size * gradient_accumulation_steps)
+  gradient_accumulation_steps: 1  # Set to 2, 4, or 8 for larger effective batch sizes
+  
   # Learning rate
   learning_rate: 1.0e-4
   
@@ -61,16 +64,34 @@ training:
   gradient_clip: 1.0
   
   # Learning rate scheduler
-  scheduler: "cosine"  # Options: "cosine", "step", "plateau", "none"
+  scheduler: "warmup_cosine"  # Options: "warmup_cosine", "onecycle", "cosine", "exponential", "polynomial", "step", "plateau", "none"
   
   # Scheduler parameters
   scheduler_params:
+    # For warmup_cosine (RECOMMENDED for PU learning)
+    warmup_epochs: 5  # Number of epochs for linear warmup
+    warmup_steps: null  # Or specify exact steps (overrides warmup_epochs)
+    
+    # For onecycle
+    pct_start: 0.3  # Percentage of training for increasing LR
+    anneal_strategy: "cos"  # "cos" or "linear"
+    div_factor: 25.0  # Initial LR = max_lr / div_factor
+    final_div_factor: 10000.0  # Final LR = initial_lr / final_div_factor
+    
+    # For exponential
+    gamma: 0.95  # Multiplicative factor per epoch
+    
+    # For polynomial
+    power: 1.0  # Polynomial power (1.0 = linear decay)
+    
     # For step scheduler
     step_size: 30
     gamma: 0.1
-    # For plateau scheduler
+    
+    # For plateau scheduler (NOT RECOMMENDED for PU learning)
     patience: 10
     factor: 0.5
+    
     # For cosine scheduler
     T_max: 100
     eta_min: 1.0e-6
@@ -86,6 +107,12 @@ training:
   
   # Validation frequency
   validate_every_n_epochs: 1
+  
+  # Model calibration (post-training)
+  calibrate_model: true  # Whether to calibrate model after training
+  calibration_method: "temperature"  # Options: "temperature", "platt"
+  calibration_max_iter: 50  # Maximum iterations for calibration optimization
+  calibration_lr: 0.01  # Learning rate for calibration optimization
 
 # nnPU Loss parameters
 loss:

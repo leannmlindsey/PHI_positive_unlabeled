@@ -9,7 +9,7 @@ import pandas as pd
 from pathlib import Path
 import pickle
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import h5py
 
 from utils.data_utils import EmbeddingLoader, MultiInstanceBag, DataProcessor
@@ -90,8 +90,21 @@ class PhageHostDataset(Dataset):
         """
         bag = self.bags[idx]
         
-        # Get embeddings
-        marker_embeddings, rbp_embeddings = bag.get_embeddings(self.embedding_loader)
+        # Get embeddings with error handling
+        try:
+            marker_embeddings, rbp_embeddings = bag.get_embeddings(self.embedding_loader, use_zero_for_missing=True)
+        except ValueError as e:
+            # Log error and return a sample with zero embeddings (will be masked out)
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.error(f"Failed to get embeddings for index {idx}: {e}")
+            # Return minimal valid sample that will be ignored due to masks
+            return {
+                'marker_embeddings': torch.zeros((self.max_markers, self.embedding_dim)),
+                'rbp_embeddings': torch.zeros((self.max_rbps, self.embedding_dim)),
+                'marker_mask': torch.zeros(self.max_markers),
+                'rbp_mask': torch.zeros(self.max_rbps),
+                'label': torch.tensor(0.0, dtype=torch.float32)
+            }
         
         # Get actual counts
         n_markers = len(bag.marker_hashes)
@@ -156,6 +169,8 @@ class PhageHostDataModule:
                  pin_memory: bool = True,
                  augment_train: bool = True,
                  seed: int = 42,
+                 lazy_loading: bool = True,
+                 cache_size: int = 10000,
                  logger: Optional[logging.Logger] = None):
         """
         Initialize the data module
@@ -172,6 +187,8 @@ class PhageHostDataModule:
             pin_memory: Whether to pin memory for GPU
             augment_train: Whether to augment training data
             seed: Random seed
+            lazy_loading: Whether to use lazy loading for embeddings
+            cache_size: Size of LRU cache for lazy loading
             logger: Optional logger
         """
         self.batch_size = batch_size
@@ -182,11 +199,21 @@ class PhageHostDataModule:
         self.pin_memory = pin_memory
         self.augment_train = augment_train
         self.seed = seed
+        self.lazy_loading = lazy_loading
+        self.cache_size = cache_size
         self.logger = logger or logging.getLogger(__name__)
         
-        # Load embeddings
-        self.logger.info(f"Loading embeddings from {embeddings_path}")
-        self.embedding_loader = EmbeddingLoader(embeddings_path, self.logger)
+        # Load embeddings with optional lazy loading
+        self.logger.info(f"Loading embeddings from {embeddings_path} (lazy={lazy_loading})")
+        if lazy_loading:
+            from utils.data_utils import LazyEmbeddingLoader
+            self.embedding_loader = LazyEmbeddingLoader(
+                embeddings_path, 
+                cache_size=cache_size,
+                logger=self.logger
+            )
+        else:
+            self.embedding_loader = EmbeddingLoader(embeddings_path, self.logger)
         
         # Load data processor
         self.logger.info(f"Loading data from {data_path}")
@@ -199,6 +226,12 @@ class PhageHostDataModule:
         
         # Prepare datasets
         self._prepare_datasets()
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get embedding cache statistics if using lazy loading"""
+        if self.lazy_loading and hasattr(self.embedding_loader, 'cache_stats'):
+            return self.embedding_loader.cache_stats()
+        return {}
         
     def _prepare_datasets(self):
         """Prepare train, validation, and test datasets"""
