@@ -49,7 +49,7 @@ training:
   gradient_accumulation_steps: 1  # Set to 2, 4, or 8 for larger effective batch sizes
   
   # Learning rate
-  learning_rate: 1.0e-5
+  learning_rate: 5.0e-5
   
   # Number of epochs
   num_epochs: 100
@@ -116,12 +116,14 @@ training:
 
 # nnPU Loss parameters
 loss:
-  # Class prior (estimated proportion of positive samples contaminating the unlabeled/negative data)
-  # In real world, ~2-5% of "negative" samples might actually be positive
-  class_prior: 0.03
+  # Class prior (proportion of true positives in the "unlabeled" portion of training data)
+  # Since we generate synthetic negatives that are truly negative, this should be 0
+  # But we use a small value for numerical stability
+  class_prior: 0.01
   
   # Beta for nnPU loss (controls negative risk correction)
-  beta: 0.0
+  # Non-zero beta helps with gradient flow
+  beta: 0.1
   
   # Gamma for nnPU loss (controls gradient penalty)
   gamma: 1.0
