@@ -11,6 +11,7 @@ import math
 from functools import wraps
 
 from .encoders import TwoTowerEncoder
+from .init_utils import init_weights_small
 
 
 def validate_outputs(func):
@@ -283,10 +284,13 @@ class MILModel(nn.Module):
         # Noisy-OR aggregation
         self.noisy_or = NoisyORLayer(epsilon=epsilon)
         
+        # Initialize weights with smaller values to prevent saturation
+        self.apply(init_weights_small)
+        
         # Logging
         logger = logging.getLogger(__name__)
         logger.info(f"MILModel initialized with embedding_dim={self.embedding_dim}, "
-                   f"temperature={temperature}")
+                   f"temperature={temperature}, using small weight initialization")
         
     def compute_pairwise_scores(self,
                                 encoded_markers: torch.Tensor,
