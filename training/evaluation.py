@@ -15,7 +15,9 @@ from sklearn.metrics import (
     average_precision_score,
     confusion_matrix,
     roc_curve,
-    precision_recall_curve
+    precision_recall_curve,
+    balanced_accuracy_score,
+    cohen_kappa_score
 )
 import logging
 
@@ -81,6 +83,61 @@ def compute_metrics(
             metrics[f'hit@{k}'] = hit_at_k
             metrics[f'recall@{k}'] = recall_at_k
             
+    return metrics
+
+
+def compute_balanced_metrics(labels: np.ndarray, predictions: np.ndarray, probabilities: np.ndarray) -> Dict[str, float]:
+    """
+    Compute balanced metrics for imbalanced data
+    
+    Args:
+        labels: True labels (binary)
+        predictions: Binary predictions
+        probabilities: Prediction probabilities
+        
+    Returns:
+        Dictionary of balanced metrics
+    """
+    metrics = {
+        'balanced_accuracy': balanced_accuracy_score(labels, predictions),
+        'cohen_kappa': cohen_kappa_score(labels, predictions),
+    }
+    
+    # Compute confusion matrix
+    cm = confusion_matrix(labels, predictions)
+    
+    # Extract confusion matrix components
+    # For binary classification: cm = [[TN, FP], [FN, TP]]
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        
+        # Add raw confusion matrix values
+        metrics['true_negatives'] = int(tn)
+        metrics['false_positives'] = int(fp)
+        metrics['false_negatives'] = int(fn)
+        metrics['true_positives'] = int(tp)
+        
+        # Add rates
+        metrics['true_positive_rate'] = tp / (tp + fn) if (tp + fn) > 0 else 0.0  # Sensitivity/Recall
+        metrics['true_negative_rate'] = tn / (tn + fp) if (tn + fp) > 0 else 0.0  # Specificity
+        metrics['false_positive_rate'] = fp / (fp + tn) if (fp + tn) > 0 else 0.0  # Fall-out
+        metrics['false_negative_rate'] = fn / (fn + tp) if (fn + tp) > 0 else 0.0  # Miss rate
+        
+        # Positive/Negative predictive values
+        metrics['positive_predictive_value'] = tp / (tp + fp) if (tp + fp) > 0 else 0.0  # Precision
+        metrics['negative_predictive_value'] = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+    
+    # Add per-class metrics
+    for class_idx in [0, 1]:
+        class_mask = labels == class_idx
+        if class_mask.sum() > 0:
+            class_acc = (predictions[class_mask] == class_idx).mean()
+            metrics[f'class_{class_idx}_accuracy'] = class_acc
+            
+            # Count predictions for this class
+            metrics[f'class_{class_idx}_support'] = int(class_mask.sum())
+            metrics[f'class_{class_idx}_predicted'] = int((predictions == class_idx).sum())
+    
     return metrics
 
 
@@ -271,6 +328,14 @@ def evaluate_model(
         config['evaluation']['metrics'],
         config['evaluation'].get('k_values', None)
     )
+    
+    # Add balanced metrics for imbalanced data
+    balanced_metrics = compute_balanced_metrics(
+        all_labels,
+        all_predictions,
+        all_probabilities
+    )
+    metrics.update(balanced_metrics)
     
     # Add loss
     metrics['loss'] = total_loss / total_samples

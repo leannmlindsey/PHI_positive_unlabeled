@@ -180,6 +180,75 @@ tail -f logs/embedding_generation_*.log
 squeue -u $USER
 ```
 
+## Training the Model
+
+### Configuration Validation
+
+Before training, validate your configuration file to catch errors early:
+
+```bash
+# Validate the default configuration
+python scripts/validate_config.py configs/default_config.yaml
+
+# Validate with verbose output (shows configuration summary)
+python scripts/validate_config.py configs/default_config.yaml --verbose
+```
+
+The validator checks:
+- **Required sections**: model, training, data, evaluation, loss, dataset
+- **ESM-2 dimensions**: Ensures input_dim matches ESM-2 model (320, 480, 640, 1280, or 2560)
+- **File paths**: Verifies data files and embeddings exist
+- **Parameter ranges**: Validates learning rates, dropout, batch sizes, etc.
+- **Scheduler settings**: Checks scheduler-specific parameters
+- **Device compatibility**: Validates CUDA/CPU/MPS settings
+
+Example output:
+```
+✓ Configuration file 'configs/default_config.yaml' is valid!
+
+Configuration summary:
+  Model type: balanced
+  Input dimension: 1280
+  Batch size: 32
+  Learning rate: 0.0001
+  Epochs: 100
+  Optimizer: adamw
+  Scheduler: warmup_cosine
+  Class prior: 0.3
+  Negative ratio: 1.0
+```
+
+### Running Training
+
+Once configuration is validated, start training:
+
+```bash
+# Train with default configuration
+python scripts/train.py --config configs/default_config.yaml
+
+# Train with custom experiment name
+python scripts/train.py --config configs/default_config.yaml \
+    --experiment_name my_experiment
+
+# Resume from checkpoint
+python scripts/train.py --config configs/default_config.yaml \
+    --checkpoint checkpoints/best_model.pt
+
+# Test only (requires checkpoint)
+python scripts/train.py --config configs/default_config.yaml \
+    --checkpoint checkpoints/best_model.pt \
+    --test_only
+```
+
+The training script will:
+1. Automatically validate configuration before starting
+2. Create output directories if they don't exist
+3. Set up logging and experiment tracking
+4. Initialize the model and data loaders
+5. Run training with early stopping and checkpointing
+6. Perform model calibration if enabled
+7. Evaluate on test set after training
+
 ## Model Architecture
 
 The model uses a two-tower architecture with noisy-OR aggregation:

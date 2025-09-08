@@ -30,6 +30,7 @@ from models.losses import nnPULoss
 from models.calibration import TemperatureScaling, PlattScaling
 from training.dataset import PhageHostDataModule
 from utils.logging_utils import setup_logger, MetricLogger, log_model_info, log_training_config
+from utils.config_validator import validate_config
 from training.evaluation import evaluate_model, compute_metrics
 
 
@@ -858,6 +859,13 @@ def main():
         log_file=f"{config['experiment_name']}.log",
         level=config['logging']['verbosity'].upper()
     )
+    
+    # Validate configuration
+    try:
+        validate_config(config, logger)
+    except (KeyError, ValueError, FileNotFoundError) as e:
+        logger.error(f"Configuration validation failed: {e}")
+        raise
     
     # Initialize trainer
     trainer = Trainer(config, logger)

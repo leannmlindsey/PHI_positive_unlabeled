@@ -8,8 +8,166 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
 import logging
 import math
+from functools import wraps
 
 from .encoders import TwoTowerEncoder
+
+
+def validate_outputs(func):
+    """
+    Decorator to validate output tensors from model forward pass
+    
+    Validates:
+    - Output dictionary structure
+    - NaN/Inf values in outputs
+    - Probability ranges [0, 1]
+    """
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        outputs = func(self, *args, **kwargs)
+        
+        # Check that outputs is a dictionary
+        assert isinstance(outputs, dict), \
+            f"Expected outputs to be a dictionary, got {type(outputs)}"
+        
+        # Validate bag probabilities
+        if 'bag_probs' in outputs:
+            bag_probs = outputs['bag_probs']
+            assert torch.is_tensor(bag_probs), \
+                "bag_probs must be a tensor"
+            assert not torch.isnan(bag_probs).any(), \
+                "bag_probs contains NaN values"
+            assert not torch.isinf(bag_probs).any(), \
+                "bag_probs contains Inf values"
+            assert (bag_probs >= 0).all() and (bag_probs <= 1).all(), \
+                f"bag_probs must be in [0, 1], got range [{bag_probs.min():.4f}, {bag_probs.max():.4f}]"
+        
+        # Validate pairwise scores if present
+        if 'pairwise_scores' in outputs:
+            pairwise_scores = outputs['pairwise_scores']
+            assert torch.is_tensor(pairwise_scores), \
+                "pairwise_scores must be a tensor"
+            assert not torch.isnan(pairwise_scores).any(), \
+                "pairwise_scores contains NaN values"
+            assert not torch.isinf(pairwise_scores).any(), \
+                "pairwise_scores contains Inf values"
+        
+        # Validate pairwise probabilities if present
+        if 'pairwise_probs' in outputs:
+            pairwise_probs = outputs['pairwise_probs']
+            assert torch.is_tensor(pairwise_probs), \
+                "pairwise_probs must be a tensor"
+            assert not torch.isnan(pairwise_probs).any(), \
+                "pairwise_probs contains NaN values"
+            assert not torch.isinf(pairwise_probs).any(), \
+                "pairwise_probs contains Inf values"
+            assert (pairwise_probs >= 0).all() and (pairwise_probs <= 1).all(), \
+                f"pairwise_probs must be in [0, 1], got range [{pairwise_probs.min():.4f}, {pairwise_probs.max():.4f}]"
+        
+        # Validate embeddings if present
+        for embed_key in ['marker_encoded', 'rbp_encoded']:
+            if embed_key in outputs:
+                embeddings = outputs[embed_key]
+                assert torch.is_tensor(embeddings), \
+                    f"{embed_key} must be a tensor"
+                assert not torch.isnan(embeddings).any(), \
+                    f"{embed_key} contains NaN values"
+                assert not torch.isinf(embeddings).any(), \
+                    f"{embed_key} contains Inf values"
+        
+        return outputs
+    
+    return wrapper
+
+
+def validate_inputs(func):
+    """
+    Decorator to validate input tensors for model forward pass
+    
+    Validates:
+    - Tensor dimensions
+    - NaN/Inf values
+    - Shape consistency
+    - Mask validity
+    """
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        # Handle both positional and keyword arguments
+        if len(args) >= 2:
+            marker_embeddings = args[0]
+            rbp_embeddings = args[1]
+            marker_mask = args[2] if len(args) > 2 else None
+            rbp_mask = args[3] if len(args) > 3 else None
+        else:
+            marker_embeddings = kwargs.get('marker_embeddings')
+            rbp_embeddings = kwargs.get('rbp_embeddings')
+            marker_mask = kwargs.get('marker_mask')
+            rbp_mask = kwargs.get('rbp_mask')
+        
+        # Validate marker embeddings
+        if marker_embeddings is not None:
+            assert marker_embeddings.dim() == 3, \
+                f"Expected marker_embeddings to be 3D (batch, n_markers, embed_dim), got {marker_embeddings.dim()}D"
+            assert not torch.isnan(marker_embeddings).any(), \
+                "marker_embeddings contains NaN values"
+            assert not torch.isinf(marker_embeddings).any(), \
+                "marker_embeddings contains Inf values"
+            assert marker_embeddings.size(0) > 0, \
+                "Batch size must be greater than 0"
+        
+        # Validate RBP embeddings
+        if rbp_embeddings is not None:
+            assert rbp_embeddings.dim() == 3, \
+                f"Expected rbp_embeddings to be 3D (batch, n_rbps, embed_dim), got {rbp_embeddings.dim()}D"
+            assert not torch.isnan(rbp_embeddings).any(), \
+                "rbp_embeddings contains NaN values"
+            assert not torch.isinf(rbp_embeddings).any(), \
+                "rbp_embeddings contains Inf values"
+            
+            # Check batch size consistency
+            if marker_embeddings is not None:
+                assert marker_embeddings.size(0) == rbp_embeddings.size(0), \
+                    f"Batch size mismatch: markers={marker_embeddings.size(0)}, rbps={rbp_embeddings.size(0)}"
+        
+        # Validate marker mask
+        if marker_mask is not None:
+            assert marker_mask.dim() in [1, 2], \
+                f"Expected marker_mask to be 1D or 2D, got {marker_mask.dim()}D"
+            if marker_mask.dim() == 1:
+                # Convert to 2D for consistency
+                marker_mask = marker_mask.unsqueeze(0)
+            assert not torch.isnan(marker_mask).any(), \
+                "marker_mask contains NaN values"
+            assert ((marker_mask == 0) | (marker_mask == 1)).all(), \
+                "marker_mask must be binary (0 or 1)"
+            
+            # Check shape consistency
+            if marker_embeddings is not None:
+                expected_shape = (marker_embeddings.size(0), marker_embeddings.size(1))
+                assert marker_mask.shape == expected_shape, \
+                    f"marker_mask shape {marker_mask.shape} doesn't match expected {expected_shape}"
+        
+        # Validate RBP mask
+        if rbp_mask is not None:
+            assert rbp_mask.dim() in [1, 2], \
+                f"Expected rbp_mask to be 1D or 2D, got {rbp_mask.dim()}D"
+            if rbp_mask.dim() == 1:
+                # Convert to 2D for consistency
+                rbp_mask = rbp_mask.unsqueeze(0)
+            assert not torch.isnan(rbp_mask).any(), \
+                "rbp_mask contains NaN values"
+            assert ((rbp_mask == 0) | (rbp_mask == 1)).all(), \
+                "rbp_mask must be binary (0 or 1)"
+            
+            # Check shape consistency
+            if rbp_embeddings is not None:
+                expected_shape = (rbp_embeddings.size(0), rbp_embeddings.size(1))
+                assert rbp_mask.shape == expected_shape, \
+                    f"rbp_mask shape {rbp_mask.shape} doesn't match expected {expected_shape}"
+        
+        return func(self, *args, **kwargs)
+    
+    return wrapper
 
 
 class NoisyORLayer(nn.Module):
@@ -200,6 +358,8 @@ class MILModel(nn.Module):
             
         return scores, mask
     
+    @validate_inputs
+    @validate_outputs
     def forward(self,
                 marker_embeddings: torch.Tensor,
                 rbp_embeddings: torch.Tensor,
