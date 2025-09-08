@@ -252,11 +252,12 @@ def save_mapping_file(host_sequences: Dict[str, str], phage_sequences: Dict[str,
         
         mappings.append({
             'index': idx,
-            'host_genome': row['host_genome'],
-            'phage_genome': row['phage_genome'],
+            'phage_id': row['phage_id'],
             'marker_hashes': marker_hashes,
             'rbp_hashes': rbp_hashes,
-            'label': row['label']
+            'rbp_length': row['rbp_length'],
+            'shannon_entropy': row['shannon_entropy'],
+            'n_unique_markers': row['n_unique_markers']
         })
     
     mapping_df = pd.DataFrame(mappings)
