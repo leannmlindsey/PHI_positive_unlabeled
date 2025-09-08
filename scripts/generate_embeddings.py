@@ -187,22 +187,60 @@ class ESM2EmbeddingGenerator:
         
     def load_model(self) -> None:
         """Load the ESM-2 model and tokenizer"""
-        # Use local path if provided, otherwise download from HuggingFace
-        if self.model_path and Path(self.model_path).exists():
-            self.logger.info(f"Loading ESM-2 model from local path: {self.model_path}")
+        # Check if model_path is a .pt checkpoint file (fair-esm format)
+        if self.model_path and Path(self.model_path).exists() and self.model_path.endswith('.pt'):
+            self.logger.info(f"Loading ESM-2 model from checkpoint: {self.model_path}")
+            
+            # Use fair-esm library for .pt checkpoints
+            try:
+                import esm
+                
+                # Load the model using fair-esm
+                model, alphabet = esm.pretrained.load_model_and_alphabet_local(self.model_path)
+                self.model = model
+                self.alphabet = alphabet
+                self.tokenizer = alphabet  # Use alphabet as tokenizer for fair-esm
+                self.use_fair_esm = True
+                
+                # Get embedding dimension
+                if hasattr(self.model, 'embed_dim'):
+                    self.embedding_dim = self.model.embed_dim
+                elif hasattr(self.model, 'args') and hasattr(self.model.args, 'embed_dim'):
+                    self.embedding_dim = self.model.args.embed_dim
+                else:
+                    # Default for ESM2_t33_650M
+                    self.embedding_dim = 1280
+                    
+            except ImportError:
+                self.logger.error("fair-esm library not found. Install with: pip install fair-esm")
+                raise
+            except Exception as e:
+                self.logger.error(f"Failed to load checkpoint with fair-esm: {e}")
+                self.logger.info("Falling back to HuggingFace model")
+                self._load_huggingface_model()
+                
+        elif self.model_path and Path(self.model_path).exists() and Path(self.model_path).is_dir():
+            # Load from a directory with HuggingFace format
+            self.logger.info(f"Loading ESM-2 model from local directory: {self.model_path}")
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, local_files_only=True)
             self.model = EsmModel.from_pretrained(self.model_path, local_files_only=True)
+            self.use_fair_esm = False
+            self.embedding_dim = self.model.config.hidden_size
         else:
-            self.logger.info(f"Loading ESM-2 model from HuggingFace: {self.model_name}")
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            self.model = EsmModel.from_pretrained(self.model_name)
+            # Download from HuggingFace
+            self._load_huggingface_model()
         
         self.model = self.model.to(self.device)
         self.model.eval()
-        
-        # Get embedding dimension
-        self.embedding_dim = self.model.config.hidden_size
         self.logger.info(f"Model loaded. Embedding dimension: {self.embedding_dim}")
+    
+    def _load_huggingface_model(self) -> None:
+        """Load model from HuggingFace"""
+        self.logger.info(f"Loading ESM-2 model from HuggingFace: {self.model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.model = EsmModel.from_pretrained(self.model_name)
+        self.use_fair_esm = False
+        self.embedding_dim = self.model.config.hidden_size
         
     def generate_embedding(self, sequence: str) -> np.ndarray:
         """
@@ -214,33 +252,52 @@ class ESM2EmbeddingGenerator:
         Returns:
             Embedding array of shape (embedding_dim,)
         """
-        # Tokenize
-        inputs = self.tokenizer(
-            sequence,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_length,
-            padding=True
-        )
-        
-        # Move to device
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        # Generate embedding
-        with torch.no_grad():
-            outputs = self.model(**inputs)
+        if hasattr(self, 'use_fair_esm') and self.use_fair_esm:
+            # Use fair-esm processing
+            import esm
             
-        # Use mean pooling over sequence length
-        embeddings = outputs.last_hidden_state
-        attention_mask = inputs['attention_mask']
-        
-        # Mask padding tokens
-        embeddings = embeddings * attention_mask.unsqueeze(-1)
-        
-        # Mean pooling
-        embedding = embeddings.sum(dim=1) / attention_mask.sum(dim=1, keepdim=True)
-        
-        return embedding.cpu().numpy()[0]
+            batch_converter = self.alphabet.get_batch_converter()
+            batch_labels, batch_strs, batch_tokens = batch_converter([("protein", sequence)])
+            batch_tokens = batch_tokens.to(self.device)
+            
+            with torch.no_grad():
+                results = self.model(batch_tokens, repr_layers=[33], return_contacts=False)
+                # Extract embeddings from the last layer
+                embeddings = results["representations"][33]
+                
+            # Remove BOS/EOS tokens and mean pool
+            embeddings = embeddings[0, 1:-1]  # Remove first and last tokens
+            embedding = embeddings.mean(dim=0)
+            
+            return embedding.cpu().numpy()
+        else:
+            # Use HuggingFace processing
+            inputs = self.tokenizer(
+                sequence,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length,
+                padding=True
+            )
+            
+            # Move to device
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Generate embedding
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                
+            # Use mean pooling over sequence length
+            embeddings = outputs.last_hidden_state
+            attention_mask = inputs['attention_mask']
+            
+            # Mask padding tokens
+            embeddings = embeddings * attention_mask.unsqueeze(-1)
+            
+            # Mean pooling
+            embedding = embeddings.sum(dim=1) / attention_mask.sum(dim=1, keepdim=True)
+            
+            return embedding.cpu().numpy()[0]
     
     def generate_embeddings_batch(self, sequences: List[str]) -> np.ndarray:
         """
@@ -252,33 +309,59 @@ class ESM2EmbeddingGenerator:
         Returns:
             Array of embeddings with shape (n_sequences, embedding_dim)
         """
-        # Tokenize batch
-        inputs = self.tokenizer(
-            sequences,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_length,
-            padding=True
-        )
-        
-        # Move to device
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        # Generate embeddings
-        with torch.no_grad():
-            outputs = self.model(**inputs)
+        if hasattr(self, 'use_fair_esm') and self.use_fair_esm:
+            # Use fair-esm processing
+            import esm
             
-        # Use mean pooling over sequence length
-        embeddings = outputs.last_hidden_state
-        attention_mask = inputs['attention_mask']
-        
-        # Mask padding tokens
-        embeddings = embeddings * attention_mask.unsqueeze(-1)
-        
-        # Mean pooling
-        embeddings = embeddings.sum(dim=1) / attention_mask.sum(dim=1, keepdim=True)
-        
-        return embeddings.cpu().numpy()
+            batch_converter = self.alphabet.get_batch_converter()
+            batch_labels = [(f"protein_{i}", seq) for i, seq in enumerate(sequences)]
+            batch_labels, batch_strs, batch_tokens = batch_converter(batch_labels)
+            batch_tokens = batch_tokens.to(self.device)
+            
+            with torch.no_grad():
+                results = self.model(batch_tokens, repr_layers=[33], return_contacts=False)
+                # Extract embeddings from the last layer
+                token_embeddings = results["representations"][33]
+                
+            # Process each sequence
+            embeddings_list = []
+            for i, seq in enumerate(sequences):
+                seq_len = len(seq)
+                # Remove BOS/EOS tokens and mean pool
+                embeddings = token_embeddings[i, 1:seq_len+1]  # Skip BOS, take seq_len tokens
+                embedding = embeddings.mean(dim=0)
+                embeddings_list.append(embedding)
+                
+            embeddings = torch.stack(embeddings_list)
+            return embeddings.cpu().numpy()
+        else:
+            # Use HuggingFace processing
+            inputs = self.tokenizer(
+                sequences,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length,
+                padding=True
+            )
+            
+            # Move to device
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Generate embeddings
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                
+            # Use mean pooling over sequence length
+            embeddings = outputs.last_hidden_state
+            attention_mask = inputs['attention_mask']
+            
+            # Mask padding tokens
+            embeddings = embeddings * attention_mask.unsqueeze(-1)
+            
+            # Mean pooling
+            embeddings = embeddings.sum(dim=1) / attention_mask.sum(dim=1, keepdim=True)
+            
+            return embeddings.cpu().numpy()
     
     def process_all_sequences(self, 
                             sequences_dict: Dict[str, str],
