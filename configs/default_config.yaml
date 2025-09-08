@@ -33,7 +33,7 @@ model:
   
   # Temperature for sigmoid in pairwise scoring
   # Higher temperature = lower initial probabilities
-  temperature: 2.0
+  temperature: 5.0
   
   # Use layer normalization
   use_layer_norm: true
