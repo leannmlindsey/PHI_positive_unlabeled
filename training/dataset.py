@@ -82,10 +82,10 @@ class PhageHostDataset(Dataset):
             
         Returns:
             Dictionary containing:
-            - host_embeddings: Padded host embeddings (max_hosts, embedding_dim)
-            - phage_embeddings: Padded phage embeddings (max_phages, embedding_dim)
-            - host_mask: Binary mask for hosts (max_hosts,)
-            - phage_mask: Binary mask for phages (max_phages,)
+            - marker_embeddings: Padded host marker embeddings (max_hosts, embedding_dim)
+            - rbp_embeddings: Padded phage RBP embeddings (max_phages, embedding_dim)
+            - marker_mask: Binary mask for markers (max_hosts,)
+            - rbp_mask: Binary mask for RBPs (max_phages,)
             - label: Binary label (scalar)
         """
         bag = self.bags[idx]
@@ -102,10 +102,10 @@ class PhageHostDataset(Dataset):
             if self.logger:
                 self.logger.error(f"Failed to get embeddings for index {idx}: {e}")
             return {
-                'host_embeddings': torch.zeros((self.max_hosts, self.embedding_dim)),
-                'phage_embeddings': torch.zeros((self.max_phages, self.embedding_dim)),
-                'host_mask': torch.zeros(self.max_hosts),
-                'phage_mask': torch.zeros(self.max_phages),
+                'marker_embeddings': torch.zeros((self.max_hosts, self.embedding_dim)),
+                'rbp_embeddings': torch.zeros((self.max_phages, self.embedding_dim)),
+                'marker_mask': torch.zeros(self.max_hosts),
+                'rbp_mask': torch.zeros(self.max_phages),
                 'label': torch.tensor(0.0, dtype=torch.float32)
             }
         
@@ -132,12 +132,12 @@ class PhageHostDataset(Dataset):
                 host_embeddings = host_embeddings + np.random.randn(*host_embeddings.shape).astype(np.float32) * noise_scale
                 phage_embeddings = phage_embeddings + np.random.randn(*phage_embeddings.shape).astype(np.float32) * noise_scale
         
-        # Convert to tensors
+        # Convert to tensors - use marker/rbp naming to match model expectations
         return {
-            'host_embeddings': torch.from_numpy(host_embeddings.astype(np.float32)),
-            'phage_embeddings': torch.from_numpy(phage_embeddings.astype(np.float32)),
-            'host_mask': torch.from_numpy(host_mask.astype(np.float32)),
-            'phage_mask': torch.from_numpy(phage_mask.astype(np.float32)),
+            'marker_embeddings': torch.from_numpy(host_embeddings.astype(np.float32)),
+            'rbp_embeddings': torch.from_numpy(phage_embeddings.astype(np.float32)),
+            'marker_mask': torch.from_numpy(host_mask.astype(np.float32)),
+            'rbp_mask': torch.from_numpy(phage_mask.astype(np.float32)),
             'label': torch.tensor(bag.label, dtype=torch.float32)
         }
 

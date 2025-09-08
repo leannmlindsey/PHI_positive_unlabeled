@@ -149,8 +149,9 @@ dataset:
   negative_sampling_seed: 42
   
   # Maximum number of proteins per bag (for padding)
-  max_markers: 2
-  max_rbps: 3
+  # Host side can have multiple wzx and/or wzm sequences (some rows have 2+ of each)
+  max_markers: 4
+  max_rbps: 20
   
   # Data loader workers
   num_workers: 4

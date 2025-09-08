@@ -57,8 +57,8 @@ class ESM2Embedder:
         self.logger.info(f"PyTorch version: {torch_version}")
         
         try:
-            # Load model checkpoint
-            checkpoint = torch.load(self.model_path, map_location=self.device)
+            # Load model checkpoint - use weights_only=False for compatibility
+            checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
             
             # Import ESM after confirming we can load the checkpoint
             import esm

@@ -86,7 +86,10 @@ More detailed file with additional metadata:
 ### Data Characteristics
 - **All interactions are positive** (prophages found in host genomes)
 - **Multi-instance nature**: 
-  - Hosts have 1-2 marker proteins (wzx and/or wzm) - in this dataset all have both
+  - Hosts can have multiple marker proteins:
+    - 521 rows have multiple wzx sequences (comma-separated)
+    - 115 rows have multiple wzm sequences (comma-separated)
+    - Most rows have 2 proteins total (1 wzx + 1 wzm), but some have 3-4
   - Phages have 1-18 RBPs per interaction:
     - 18,888 rows (74.2%) have 1 RBP
     - 5,394 rows (21.2%) have 2 RBPs

@@ -57,21 +57,37 @@ def extract_all_sequences(data_path: str) -> Tuple[Dict[str, str], Dict[str, str
     print("\nExtracting and hashing sequences...")
     
     for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing"):
-        # Process wzx sequence
-        wzx_seq = str(row['wzx_seq']).strip()
-        if wzx_seq and wzx_seq != 'nan' and wzx_seq != 'NaN' and wzx_seq != '':
-            wzx_hash = compute_md5(wzx_seq)
-            host_sequences[wzx_hash] = wzx_seq
-            stats['total_wzx'] += 1
+        # Process wzx sequences (can be comma-separated)
+        wzx_field = str(row['wzx_seq']).strip()
+        if wzx_field and wzx_field != 'nan' and wzx_field != 'NaN' and wzx_field != '':
+            # Split by comma if multiple sequences
+            if ',' in wzx_field:
+                wzx_seqs = [seq.strip() for seq in wzx_field.split(',') if seq.strip()]
+            else:
+                wzx_seqs = [wzx_field]
+            
+            for wzx_seq in wzx_seqs:
+                if wzx_seq and wzx_seq != 'nan':
+                    wzx_hash = compute_md5(wzx_seq)
+                    host_sequences[wzx_hash] = wzx_seq
+                    stats['total_wzx'] += 1
         else:
             stats['empty_wzx'] += 1
             
-        # Process wzm sequence  
-        wzm_seq = str(row['wzm_seq']).strip()
-        if wzm_seq and wzm_seq != 'nan' and wzm_seq != 'NaN' and wzm_seq != '':
-            wzm_hash = compute_md5(wzm_seq)
-            host_sequences[wzm_hash] = wzm_seq
-            stats['total_wzm'] += 1
+        # Process wzm sequences (can be comma-separated)
+        wzm_field = str(row['wzm_seq']).strip()
+        if wzm_field and wzm_field != 'nan' and wzm_field != 'NaN' and wzm_field != '':
+            # Split by comma if multiple sequences
+            if ',' in wzm_field:
+                wzm_seqs = [seq.strip() for seq in wzm_field.split(',') if seq.strip()]
+            else:
+                wzm_seqs = [wzm_field]
+            
+            for wzm_seq in wzm_seqs:
+                if wzm_seq and wzm_seq != 'nan':
+                    wzm_hash = compute_md5(wzm_seq)
+                    host_sequences[wzm_hash] = wzm_seq
+                    stats['total_wzm'] += 1
         else:
             stats['empty_wzm'] += 1
             
@@ -142,16 +158,32 @@ def add_hash_columns_to_data(data_path: str, output_path: str) -> pd.DataFrame:
     phage_hashes = []
     
     for idx, row in tqdm(df.iterrows(), total=len(df), desc="Computing hashes"):
-        # Host hashes (wzx and wzm)
+        # Host hashes (wzx and wzm - can be comma-separated)
         host_set = []
         
-        wzx_seq = str(row['wzx_seq']).strip()
-        if wzx_seq and wzx_seq != 'nan' and wzx_seq != 'NaN' and wzx_seq != '':
-            host_set.append(compute_md5(wzx_seq))
+        # Process wzx sequences
+        wzx_field = str(row['wzx_seq']).strip()
+        if wzx_field and wzx_field != 'nan' and wzx_field != 'NaN' and wzx_field != '':
+            if ',' in wzx_field:
+                wzx_seqs = [seq.strip() for seq in wzx_field.split(',') if seq.strip()]
+            else:
+                wzx_seqs = [wzx_field]
             
-        wzm_seq = str(row['wzm_seq']).strip()
-        if wzm_seq and wzm_seq != 'nan' and wzm_seq != 'NaN' and wzm_seq != '':
-            host_set.append(compute_md5(wzm_seq))
+            for wzx_seq in wzx_seqs:
+                if wzx_seq and wzx_seq != 'nan':
+                    host_set.append(compute_md5(wzx_seq))
+        
+        # Process wzm sequences
+        wzm_field = str(row['wzm_seq']).strip()
+        if wzm_field and wzm_field != 'nan' and wzm_field != 'NaN' and wzm_field != '':
+            if ',' in wzm_field:
+                wzm_seqs = [seq.strip() for seq in wzm_field.split(',') if seq.strip()]
+            else:
+                wzm_seqs = [wzm_field]
+            
+            for wzm_seq in wzm_seqs:
+                if wzm_seq and wzm_seq != 'nan':
+                    host_set.append(compute_md5(wzm_seq))
             
         host_hashes.append(','.join(host_set))
         
