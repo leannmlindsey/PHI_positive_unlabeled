@@ -49,7 +49,7 @@ training:
   gradient_accumulation_steps: 1  # Set to 2, 4, or 8 for larger effective batch sizes
   
   # Learning rate
-  learning_rate: 5.0e-5
+  learning_rate: 1.0e-4
   
   # Number of epochs
   num_epochs: 100
@@ -150,7 +150,7 @@ dataset:
   
   # Maximum number of proteins per bag (for padding)
   max_markers: 2
-  max_rbps: 20
+  max_rbps: 3
   
   # Data loader workers
   num_workers: 4
