@@ -32,7 +32,8 @@ model:
   dropout: 0.1
   
   # Temperature for sigmoid in pairwise scoring
-  temperature: 1.0
+  # Higher temperature = lower initial probabilities
+  temperature: 2.0
   
   # Use layer normalization
   use_layer_norm: true
@@ -116,10 +117,9 @@ training:
 
 # nnPU Loss parameters
 loss:
-  # Class prior (proportion of true positives in the "unlabeled" portion of training data)
-  # Since we generate synthetic negatives that are truly negative, this should be 0
-  # But we use a small value for numerical stability
-  class_prior: 0.01
+  # Class prior (proportion of positives in the training data)
+  # Since we use 1:1 positive:negative ratio, this should be 0.5
+  class_prior: 0.5
   
   # Beta for nnPU loss (controls negative risk correction)
   # Non-zero beta helps with gradient flow
