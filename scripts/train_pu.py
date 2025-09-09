@@ -150,7 +150,7 @@ class PUTrainer:
         self.optimizer = self._build_optimizer()
         
         # Metrics
-        self.metric_logger = MetricLogger()
+        self.metric_logger = MetricLogger(log_dir='logs')
         
         self.logger.info(f"PU Trainer initialized with prior={self.prior}")
     
