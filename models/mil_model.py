@@ -12,6 +12,7 @@ from functools import wraps
 
 from .encoders import TwoTowerEncoder
 from .init_utils import init_weights_small
+from .scorer import CosineScorer, StableNoisyOR, init_pair_bias
 
 
 def validate_outputs(func):
@@ -281,6 +282,11 @@ class MILModel(nn.Module):
         
         self.embedding_dim = self.encoder.get_embedding_dim()
         
+        # Cosine similarity scorer with learnable scale and bias
+        # Initialize bias based on expected bag prior (0.5 for balanced training)
+        init_bias = init_pair_bias(bag_prior=0.5, mean_num_pairs=20)  # Assuming ~20 valid pairs per bag
+        self.scorer = CosineScorer(init_scale=1.0, init_bias=init_bias)
+        
         # Noisy-OR aggregation
         self.noisy_or = NoisyORLayer(epsilon=epsilon)
         
@@ -298,7 +304,7 @@ class MILModel(nn.Module):
                                 marker_mask: Optional[torch.Tensor] = None,
                                 rbp_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute pairwise scores between all marker-RBP pairs
+        Compute pairwise scores between all marker-RBP pairs using cosine similarity
         
         Args:
             encoded_markers: Encoded marker proteins (B, n_markers, d)
@@ -332,15 +338,9 @@ class MILModel(nn.Module):
             if rbp_mask.size(0) == 1 and encoded_rbps.size(0) > 1:
                 rbp_mask = rbp_mask.expand(encoded_rbps.size(0), -1)
         
-        # Compute scaled dot product
-        # (B, n_markers, d) @ (B, d, n_rbps) -> (B, n_markers, n_rbps)
-        scores = torch.bmm(encoded_markers, encoded_rbps.transpose(1, 2))
-        
-        # Scale by sqrt(d) for stability
-        scores = scores / math.sqrt(self.embedding_dim)
-        
-        # Apply temperature scaling (divide to reduce scores)
-        scores = scores / self.temperature
+        # Use CosineScorer to compute logits
+        # This normalizes embeddings and applies learnable scale and bias
+        scores = self.scorer(encoded_markers, encoded_rbps)
         
         # Create combined mask with proper shape checking
         if marker_mask is not None and rbp_mask is not None:
