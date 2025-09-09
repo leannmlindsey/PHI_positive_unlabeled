@@ -287,8 +287,8 @@ class MILModel(nn.Module):
         init_bias = init_pair_bias(bag_prior=0.5, mean_num_pairs=20)  # Assuming ~20 valid pairs per bag
         self.scorer = CosineScorer(init_scale=1.0, init_bias=init_bias)
         
-        # Noisy-OR aggregation
-        self.noisy_or = NoisyORLayer(epsilon=epsilon)
+        # Stable Noisy-OR aggregation (works in log space)
+        self.noisy_or = StableNoisyOR(epsilon=epsilon)
         
         # Initialize weights with smaller values to prevent saturation
         self.apply(init_weights_small)

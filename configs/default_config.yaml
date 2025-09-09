@@ -49,8 +49,8 @@ training:
   # Gradient accumulation steps (effective batch size = batch_size * gradient_accumulation_steps)
   gradient_accumulation_steps: 1  # Set to 2, 4, or 8 for larger effective batch sizes
   
-  # Learning rate
-  learning_rate: 1.0e-4
+  # Learning rate (increased for better convergence)
+  learning_rate: 3.0e-4
   
   # Number of epochs
   num_epochs: 100
@@ -71,7 +71,7 @@ training:
   scheduler_params:
     # For warmup_cosine (RECOMMENDED for PU learning)
     warmup_epochs: 5  # Number of epochs for linear warmup
-    warmup_steps: 1000  # Or specify exact steps (overrides warmup_epochs)
+    warmup_steps: 200  # Reduced warmup steps for faster initial learning
     
     # For onecycle
     pct_start: 0.3  # Percentage of training for increasing LR
@@ -122,11 +122,12 @@ loss:
   class_prior: 0.5
   
   # Beta for nnPU loss (controls negative risk correction)
-  # Non-zero beta helps with gradient flow
-  beta: 0.1
+  # Set to 0 for simplified loss
+  beta: 0.0
   
   # Gamma for nnPU loss (controls gradient penalty)
-  gamma: 1.0
+  # Set to 0 to disable gradient penalty
+  gamma: 0.0
   
   # Use hard bootstrapping
   hard_bootstrap: false
