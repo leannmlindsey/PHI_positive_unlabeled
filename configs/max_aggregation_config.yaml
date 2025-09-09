@@ -1,0 +1,224 @@
+# Configuration using max aggregation instead of Noisy-OR
+# Max aggregation is often more stable for initial training
+
+# Copy all settings from default
+# Data paths
+data:
+  data_path: "data/dedup.labeled_marker_rbp_phageID_with_hashes.tsv"
+  splits_path: "data/processed/splits.pkl"
+  embeddings_path: "data/embeddings"
+  output_dir: "outputs"
+  checkpoint_dir: "checkpoints"
+
+# Model architecture
+model:
+  # Embedding dimension from ESM-2
+  input_dim: 1280
+  
+  # Encoder architecture options
+  encoder_type: "balanced"  # Options: "conservative", "balanced", "aggressive"
+  
+  # Balanced encoder dimensions (1280 -> 768 -> 512 -> 256)
+  encoder_dims_balanced: [768, 512, 256]
+  
+  # Conservative encoder dimensions (1280 -> 1024 -> 512)
+  encoder_dims_conservative: [1024, 512]
+  
+  # Aggressive encoder dimensions (1280 -> 512 -> 256 -> 128)
+  encoder_dims_aggressive: [512, 256, 128]
+  
+  # Final embedding dimension (last layer of encoder)
+  embedding_dim: 256  # Will be overridden based on encoder_type
+  
+  # Dropout rate
+  dropout: 0.1
+  
+  # Temperature for sigmoid in pairwise scoring
+  temperature: 1.0
+  
+  # Use layer normalization
+  use_layer_norm: true
+  
+  # Activation function
+  activation: "relu"  # Options: "relu", "gelu", "tanh"
+  
+  # IMPORTANT: Use max aggregation instead of noisy-OR
+  aggregation: "max"  # Options: "noisy_or", "max"
+
+# Training parameters
+training:
+  # Batch size
+  batch_size: 32
+  
+  # Gradient accumulation steps
+  gradient_accumulation_steps: 1
+  
+  # Learning rate (higher for max aggregation)
+  learning_rate: 5.0e-4
+  
+  # Number of epochs
+  num_epochs: 100
+  
+  # Optimizer
+  optimizer: "adamw"  # Options: "adam", "adamw", "sgd"
+  
+  # Weight decay (L2 regularization)
+  weight_decay: 1.0e-5
+  
+  # Gradient clipping
+  gradient_clip: 1.0
+  
+  # Learning rate scheduler
+  scheduler: "warmup_cosine"
+  
+  # Scheduler parameters
+  scheduler_params:
+    # Shorter warmup for max aggregation
+    warmup_epochs: 2
+    warmup_steps: 100
+    
+    # For onecycle
+    pct_start: 0.3
+    anneal_strategy: "cos"
+    div_factor: 25.0
+    final_div_factor: 10000.0
+    
+    # For exponential
+    gamma: 0.95
+    
+    # For polynomial
+    power: 1.0
+    
+    # For step scheduler
+    step_size: 30
+    gamma: 0.1
+    
+    # For plateau scheduler
+    patience: 10
+    factor: 0.5
+    
+    # For cosine scheduler
+    T_max: 100
+    eta_min: 1.0e-6
+  
+  # Early stopping
+  early_stopping: true
+  early_stopping_patience: 20
+  early_stopping_min_delta: 1.0e-4
+  
+  # Checkpoint saving
+  save_every_n_epochs: 5
+  save_best_only: true
+  
+  # Validation frequency
+  validate_every_n_epochs: 1
+  
+  # Model calibration (post-training)
+  calibrate_model: true
+  calibration_method: "temperature"
+  calibration_max_iter: 50
+  calibration_lr: 0.01
+
+# nnPU Loss parameters
+loss:
+  # Class prior (proportion of positives in the training data)
+  class_prior: 0.5
+  
+  # Beta for nnPU loss (simplified)
+  beta: 0.0
+  
+  # Gamma for nnPU loss (simplified)
+  gamma: 0.0
+  
+  # Use hard bootstrapping
+  hard_bootstrap: false
+
+# Data parameters
+dataset:
+  # Negative sampling ratio (negative:positive)
+  negative_ratio: 1.0
+  
+  # Validation negative ratio
+  val_negative_ratio: 4.0
+  
+  # Test negative ratio
+  test_negative_ratio: 49.0
+  
+  # Random seed for negative sampling
+  negative_sampling_seed: 42
+  
+  # Maximum number of proteins per bag
+  max_markers: 4
+  max_rbps: 20
+  
+  # Data loader workers
+  num_workers: 4
+  
+  # Pin memory for faster GPU transfer
+  pin_memory: true
+
+# Evaluation parameters
+evaluation:
+  # Metrics to compute
+  metrics:
+    - "accuracy"
+    - "mcc"
+    - "f1"
+    - "precision"
+    - "recall"
+    - "auroc"
+    - "auprc"
+  
+  # Threshold for binary classification
+  classification_threshold: 0.5
+  
+  # Save predictions
+  save_predictions: true
+  
+  # Generate confusion matrix
+  generate_confusion_matrix: true
+
+# Logging parameters
+logging:
+  # Use wandb for experiment tracking
+  use_wandb: true
+  
+  # Wandb project name
+  wandb_project: "phage-host-pu-learning"
+  
+  # Wandb entity (username or team)
+  wandb_entity: null
+  
+  # Log frequency (batches)
+  log_every_n_batches: 10
+  
+  # Log directory
+  log_dir: "logs"
+  
+  # Verbosity level
+  verbosity: "info"
+
+# Random seeds for reproducibility
+seeds:
+  # General random seed
+  random_seed: 42
+  
+  # PyTorch seed
+  torch_seed: 42
+  
+  # NumPy seed
+  numpy_seed: 42
+
+# Device settings
+device:
+  # Device to use
+  device: "cuda"
+  
+  # CUDA device ID (if multiple GPUs)
+  cuda_device_id: 0
+  
+  # Mixed precision training
+  use_mixed_precision: false
+  
+  # Distributed training
+  distributed: false

@@ -79,6 +79,7 @@ def init_pair_bias(bag_prior, mean_num_pairs):
 class StableNoisyOR(nn.Module):
     """
     Numerically stable Noisy-OR aggregation working in log space
+    Returns logits instead of probabilities for stable gradient flow
     """
     
     def __init__(self, epsilon=1e-6):
@@ -87,32 +88,39 @@ class StableNoisyOR(nn.Module):
     
     def forward(self, logits, mask=None):
         """
-        Compute Noisy-OR aggregation in log space for numerical stability
+        Compute Noisy-OR aggregation in log space, returning bag logits
         
         Args:
             logits: [B, M, R] pairwise logits
             mask: [B, M, R] binary mask (1 for valid pairs, 0 for invalid)
             
         Returns:
-            bag_probs: [B] bag-level probabilities
+            bag_logits: [B] bag-level logits (not probabilities!)
         """
         # Use identity: 1 - σ(ℓ) = σ(-ℓ)
-        # log σ(-ℓ) is stable for large |ℓ|
+        # log σ(-ℓ) = -softplus(ℓ) is stable for large |ℓ|
         log_one_minus_p = F.logsigmoid(-logits)  # [B, M, R]
         
         # Apply mask: invalid pairs contribute log(1) = 0 to the sum
         if mask is not None:
             log_one_minus_p = log_one_minus_p * mask
         
-        # Sum over all pairs
-        sum_log = log_one_minus_p.sum(dim=(1, 2))  # [B]
+        # Sum over all pairs: S = log(prod(1 - p_ij))
+        S = log_one_minus_p.sum(dim=(1, 2))  # [B], S <= 0
         
-        # Compute bag probability: P = 1 - exp(sum_log)
-        # Clamp to avoid under/overflow
-        p_neg = torch.exp(sum_log.clamp(min=-50.0, max=0.0))
-        p_pos = (1.0 - p_neg).clamp(self.epsilon, 1 - self.epsilon)
+        # Compute bag logit from Noisy-OR probability
+        # p_bag = 1 - exp(S)
+        # bag_logit = log(p_bag / (1 - p_bag)) = log((1 - exp(S)) / exp(S))
+        # = log(1 - exp(S)) - S
         
-        return p_pos
+        # Stable computation:
+        S_clamped = S.clamp(min=-50.0, max=-self.epsilon)
+        p_neg = torch.exp(S_clamped)
+        
+        # bag_logit = log((1 - p_neg) / p_neg)
+        bag_logits = torch.log1p(-p_neg) - torch.log(p_neg + self.epsilon)
+        
+        return bag_logits
 
 
 class MaxAggregator(nn.Module):

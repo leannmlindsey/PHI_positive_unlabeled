@@ -12,7 +12,7 @@ from functools import wraps
 
 from .encoders import TwoTowerEncoder
 from .init_utils import init_weights_small
-from .scorer import CosineScorer, StableNoisyOR, init_pair_bias
+from .scorer import CosineScorer, StableNoisyOR, MaxAggregator, init_pair_bias
 
 
 def validate_outputs(func):
@@ -250,7 +250,8 @@ class MILModel(nn.Module):
                  activation: str = 'relu',
                  use_layer_norm: bool = True,
                  temperature: float = 1.0,
-                 epsilon: float = 1e-7):
+                 epsilon: float = 1e-7,
+                 aggregation: str = 'noisy_or'):
         """
         Initialize the MIL model
         
@@ -263,6 +264,7 @@ class MILModel(nn.Module):
             use_layer_norm: Whether to use layer normalization
             temperature: Temperature for sigmoid scaling
             epsilon: Small constant for numerical stability
+            aggregation: Aggregation method ('noisy_or' or 'max')
         """
         super().__init__()
         
@@ -283,12 +285,19 @@ class MILModel(nn.Module):
         self.embedding_dim = self.encoder.get_embedding_dim()
         
         # Cosine similarity scorer with learnable scale and bias
-        # Initialize bias based on expected bag prior (0.5 for balanced training)
-        init_bias = init_pair_bias(bag_prior=0.5, mean_num_pairs=20)  # Assuming ~20 valid pairs per bag
+        # Initialize with more negative bias to prevent trivial positive predictions
+        # With ~4 valid pairs per bag (2 markers * 2 RBPs on average), use lower prior
+        init_bias = init_pair_bias(bag_prior=0.2, mean_num_pairs=4)  # More conservative initialization
         self.scorer = CosineScorer(init_scale=1.0, init_bias=init_bias)
         
-        # Stable Noisy-OR aggregation (works in log space)
-        self.noisy_or = StableNoisyOR(epsilon=epsilon)
+        # Aggregation layer
+        self.aggregation = aggregation
+        if aggregation == 'noisy_or':
+            self.aggregator = StableNoisyOR(epsilon=epsilon)
+        elif aggregation == 'max':
+            self.aggregator = MaxAggregator(epsilon=epsilon)
+        else:
+            raise ValueError(f"Unknown aggregation method: {aggregation}")
         
         # Initialize weights with smaller values to prevent saturation
         self.apply(init_weights_small)
@@ -395,7 +404,7 @@ class MILModel(nn.Module):
             rbp_mask
         )
         
-        # Compute pairwise scores
+        # Compute pairwise scores (logits)
         scores, combined_mask = self.compute_pairwise_scores(
             encoded_markers,
             encoded_rbps,
@@ -403,21 +412,26 @@ class MILModel(nn.Module):
             rbp_mask
         )
         
-        # Convert scores to probabilities
-        pairwise_probs = torch.sigmoid(scores)
+        # Aggregate to bag level (returns logits)
+        bag_logits = self.aggregator(scores, combined_mask)
         
-        # Apply mask to probabilities
+        # Convert to probabilities
+        bag_probs = torch.sigmoid(bag_logits)
+        
+        # For backward compatibility, also compute pairwise probs
+        pairwise_probs = torch.sigmoid(scores)
         if combined_mask is not None:
             pairwise_probs = pairwise_probs * combined_mask
-            
-        # Aggregate to bag level using Noisy-OR
-        bag_probs = self.noisy_or(pairwise_probs, combined_mask)
         
         # Prepare output
-        output = {'bag_probs': bag_probs}
+        output = {
+            'bag_probs': bag_probs,
+            'bag_logits': bag_logits  # Important: return logits for loss computation
+        }
         
         if return_pairwise:
             output['pairwise_probs'] = pairwise_probs
+            output['pairwise_logits'] = scores
             output['encoded_markers'] = encoded_markers
             output['encoded_rbps'] = encoded_rbps
             
