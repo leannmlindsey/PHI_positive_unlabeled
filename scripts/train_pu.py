@@ -56,16 +56,35 @@ class PUDataLoaders:
         # Get the full training dataset
         self.full_dataset = data_module.train_dataset
         
-        # Separate positive and unlabeled indices
+        print(f"Separating P and U from dataset of size {len(self.full_dataset)}...")
+        
+        # Separate positive and unlabeled indices based on labels
+        # Access the labels directly from the dataset without loading embeddings
         self.pos_indices = []
         self.unlab_indices = []
         
-        for idx in range(len(self.full_dataset)):
-            sample = self.full_dataset[idx]
-            if sample['label'] == 1:
-                self.pos_indices.append(idx)
-            else:
-                self.unlab_indices.append(idx)
+        # If the dataset has a labels attribute, use it directly
+        if hasattr(self.full_dataset, 'labels'):
+            labels = self.full_dataset.labels
+            self.pos_indices = [i for i, label in enumerate(labels) if label == 1]
+            self.unlab_indices = [i for i, label in enumerate(labels) if label == 0]
+        else:
+            # Fall back to checking each sample (slower but works)
+            print("  Note: Dataset doesn't have direct label access, this may be slow...")
+            for idx in range(len(self.full_dataset)):
+                if idx % 1000 == 0:
+                    print(f"  Processed {idx}/{len(self.full_dataset)} samples...")
+                # Just check the label without loading the full sample
+                if hasattr(self.full_dataset, 'data') and 'label' in self.full_dataset.data.iloc[idx]:
+                    label = self.full_dataset.data.iloc[idx]['label']
+                else:
+                    sample = self.full_dataset[idx]
+                    label = sample['label']
+                
+                if label == 1:
+                    self.pos_indices.append(idx)
+                else:
+                    self.unlab_indices.append(idx)
         
         print(f"Dataset split: {len(self.pos_indices)} positive, {len(self.unlab_indices)} unlabeled")
         
