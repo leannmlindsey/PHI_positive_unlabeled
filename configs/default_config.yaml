@@ -32,8 +32,8 @@ model:
   dropout: 0.1
   
   # Temperature for sigmoid in pairwise scoring
-  # Higher temperature = lower initial probabilities
-  temperature: 5.0
+  # Set to 1.0 for standard sigmoid behavior
+  temperature: 1.0
   
   # Use layer normalization
   use_layer_norm: true
