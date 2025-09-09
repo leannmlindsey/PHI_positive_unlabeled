@@ -239,9 +239,9 @@ def train_xgboost(X_train, y_train, X_val, y_val):
     model = xgb.train(
         params,
         dtrain,
-        num_boost_round=1000,
+        num_boost_round=200,  # Reduced from 1000
         evals=evallist,
-        early_stopping_rounds=50,
+        early_stopping_rounds=30,  # Stop if no improvement for 30 rounds
         verbose_eval=10
     )
     
