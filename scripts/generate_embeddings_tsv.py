@@ -1,13 +1,14 @@
 """
-ESM-2 Embedding Generation Script for TSV input
-Generates embeddings from TSV file with ID and sequence columns
-Adds MD5 hash column and saves embeddings in NPZ format
+ESM-2 Embedding Generation Script for multiple input formats
+Generates embeddings from TSV, FASTA, or JSON files
+Adds MD5 hash column/field and saves embeddings in NPZ format
 """
 
 import os
 import sys
 import argparse
 import csv
+import json
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 import numpy as np
@@ -32,13 +33,138 @@ def calculate_md5(sequence: str) -> str:
     return hashlib.md5(sequence.encode()).hexdigest()
 
 
-def process_tsv_file(input_path: str, output_path: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+def detect_file_format(input_path: str) -> str:
     """
-    Process TSV file: add MD5 column and extract sequences
+    Detect the format of the input file
+    
+    Args:
+        input_path: Path to input file
+        
+    Returns:
+        File format: 'tsv', 'fasta', or 'json'
+    """
+    # Check extension first
+    ext = Path(input_path).suffix.lower()
+    if ext in ['.tsv', '.txt']:
+        return 'tsv'
+    elif ext in ['.fasta', '.fa', '.faa']:
+        return 'fasta'
+    elif ext == '.json':
+        return 'json'
+    
+    # If extension is ambiguous, check content
+    with open(input_path, 'r') as f:
+        first_line = f.readline().strip()
+        if first_line.startswith('>'):
+            return 'fasta'
+        elif first_line.startswith('{') or first_line.startswith('['):
+            return 'json'
+        else:
+            # Assume TSV if has tabs
+            if '\t' in first_line:
+                return 'tsv'
+    
+    # Default to TSV
+    return 'tsv'
+
+
+def process_fasta_file(input_path: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    """
+    Process FASTA file and extract sequences
+    
+    Args:
+        input_path: Path to input FASTA file
+        
+    Returns:
+        Tuple of:
+        - sequences_by_id: Dict mapping original ID to sequence
+        - sequences_by_md5: Dict mapping MD5 hash to sequence  
+        - id_to_md5: Dict mapping original ID to MD5 hash
+    """
+    logger = setup_logging('process_fasta')
+    logger.info(f"Processing FASTA file: {input_path}")
+    
+    sequences_by_id = {}
+    sequences_by_md5 = {}
+    id_to_md5 = {}
+    
+    current_id = None
+    current_seq = []
+    
+    with open(input_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('>'):
+                # Save previous sequence if exists
+                if current_id and current_seq:
+                    sequence = ''.join(current_seq).upper()
+                    md5_hash = calculate_md5(sequence)
+                    sequences_by_id[current_id] = sequence
+                    sequences_by_md5[md5_hash] = sequence
+                    id_to_md5[current_id] = md5_hash
+                
+                # Start new sequence
+                current_id = line[1:].split()[0]  # Take first part after '>'
+                current_seq = []
+            else:
+                if line:  # Skip empty lines
+                    current_seq.append(line)
+        
+        # Save last sequence
+        if current_id and current_seq:
+            sequence = ''.join(current_seq).upper()
+            md5_hash = calculate_md5(sequence)
+            sequences_by_id[current_id] = sequence
+            sequences_by_md5[md5_hash] = sequence
+            id_to_md5[current_id] = md5_hash
+    
+    logger.info(f"Processed {len(sequences_by_id)} sequences")
+    logger.info(f"Found {len(sequences_by_md5)} unique sequences (by MD5)")
+    
+    return sequences_by_id, sequences_by_md5, id_to_md5
+
+
+def process_json_file(input_path: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    """
+    Process JSON file with MD5 hash keys mapping to sequences
+    
+    Args:
+        input_path: Path to input JSON file
+        
+    Returns:
+        Tuple of:
+        - sequences_by_id: Dict mapping MD5 hash to sequence (same as sequences_by_md5 for JSON)
+        - sequences_by_md5: Dict mapping MD5 hash to sequence  
+        - id_to_md5: Dict mapping MD5 hash to itself (for consistency)
+    """
+    logger = setup_logging('process_json')
+    logger.info(f"Processing JSON file: {input_path}")
+    
+    with open(input_path, 'r') as f:
+        data = json.load(f)
+    
+    sequences_by_md5 = {}
+    sequences_by_id = {}
+    id_to_md5 = {}
+    
+    # JSON format has MD5 as keys already
+    for md5_hash, sequence in data.items():
+        sequence = sequence.strip().upper()
+        sequences_by_md5[md5_hash] = sequence
+        sequences_by_id[md5_hash] = sequence  # Use MD5 as ID for JSON format
+        id_to_md5[md5_hash] = md5_hash
+    
+    logger.info(f"Processed {len(sequences_by_md5)} sequences")
+    
+    return sequences_by_id, sequences_by_md5, id_to_md5
+
+
+def process_tsv_file(input_path: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    """
+    Process TSV file and extract sequences
     
     Args:
         input_path: Path to input TSV file with columns: id, sequence
-        output_path: Path to save augmented TSV with MD5 column
         
     Returns:
         Tuple of:
@@ -53,18 +179,12 @@ def process_tsv_file(input_path: str, output_path: str) -> Tuple[Dict[str, str],
     sequences_by_md5 = {}
     id_to_md5 = {}
     
-    # Read input TSV and write augmented TSV
-    with open(input_path, 'r') as infile, open(output_path, 'w', newline='') as outfile:
+    with open(input_path, 'r') as infile:
         reader = csv.DictReader(infile, delimiter='\t')
         
         # Validate columns
         if 'id' not in reader.fieldnames or 'sequence' not in reader.fieldnames:
             raise ValueError("TSV must have 'id' and 'sequence' columns")
-        
-        # Set up writer with MD5 column added
-        fieldnames = ['id', 'sequence', 'md5']
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames, delimiter='\t')
-        writer.writeheader()
         
         # Process each row
         for row in reader:
@@ -78,19 +198,65 @@ def process_tsv_file(input_path: str, output_path: str) -> Tuple[Dict[str, str],
             sequences_by_id[seq_id] = sequence
             sequences_by_md5[md5_hash] = sequence
             id_to_md5[seq_id] = md5_hash
-            
-            # Write augmented row
-            writer.writerow({
-                'id': seq_id,
-                'sequence': sequence,
-                'md5': md5_hash
-            })
     
     logger.info(f"Processed {len(sequences_by_id)} sequences")
     logger.info(f"Found {len(sequences_by_md5)} unique sequences (by MD5)")
-    logger.info(f"Saved augmented TSV to: {output_path}")
     
     return sequences_by_id, sequences_by_md5, id_to_md5
+
+
+def save_augmented_tsv(sequences_by_id: Dict[str, str], id_to_md5: Dict[str, str], 
+                       output_path: str) -> None:
+    """
+    Save sequences with MD5 hashes to TSV file
+    
+    Args:
+        sequences_by_id: Dict mapping ID to sequence
+        id_to_md5: Dict mapping ID to MD5 hash
+        output_path: Path to save augmented TSV
+    """
+    with open(output_path, 'w', newline='') as outfile:
+        fieldnames = ['id', 'sequence', 'md5']
+        writer = csv.DictWriter(outfile, fieldnames=fieldnames, delimiter='\t')
+        writer.writeheader()
+        
+        for seq_id, sequence in sequences_by_id.items():
+            writer.writerow({
+                'id': seq_id,
+                'sequence': sequence,
+                'md5': id_to_md5[seq_id]
+            })
+
+
+def process_input_file(input_path: str, file_format: Optional[str] = None) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    """
+    Process input file of any supported format
+    
+    Args:
+        input_path: Path to input file
+        file_format: Format of file ('tsv', 'fasta', 'json'), auto-detected if None
+        
+    Returns:
+        Tuple of:
+        - sequences_by_id: Dict mapping original ID to sequence
+        - sequences_by_md5: Dict mapping MD5 hash to sequence  
+        - id_to_md5: Dict mapping original ID to MD5 hash
+    """
+    # Detect format if not specified
+    if file_format is None:
+        file_format = detect_file_format(input_path)
+        logger = setup_logging('process_input')
+        logger.info(f"Detected file format: {file_format}")
+    
+    # Process based on format
+    if file_format == 'tsv':
+        return process_tsv_file(input_path)
+    elif file_format == 'fasta':
+        return process_fasta_file(input_path)
+    elif file_format == 'json':
+        return process_json_file(input_path)
+    else:
+        raise ValueError(f"Unsupported file format: {file_format}")
 
 
 class ESM2Embedder:
@@ -324,11 +490,13 @@ class ESM2Embedder:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate ESM-2 embeddings from TSV file')
-    parser.add_argument('input_tsv', type=str,
-                       help='Path to input TSV file with columns: id, sequence')
+    parser = argparse.ArgumentParser(description='Generate ESM-2 embeddings from TSV, FASTA, or JSON files')
+    parser.add_argument('input_file', type=str,
+                       help='Path to input file (TSV with id/sequence columns, FASTA, or JSON with MD5 keys)')
     parser.add_argument('--output_dir', type=str, default='embeddings_output',
                        help='Directory to save outputs')
+    parser.add_argument('--format', type=str, choices=['tsv', 'fasta', 'json'], default=None,
+                       help='Input file format (auto-detected if not specified)')
     parser.add_argument('--model_name', type=str, default='esm2_t33_650M_UR50D',
                        help='ESM model name')
     parser.add_argument('--batch_size', type=int, default=8,
@@ -347,14 +515,17 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Process TSV file and add MD5 column
-    augmented_tsv_path = os.path.join(args.output_dir, args.augmented_tsv_name)
-    sequences_by_id, sequences_by_md5, id_to_md5 = process_tsv_file(
-        args.input_tsv, 
-        augmented_tsv_path
+    # Process input file based on format
+    sequences_by_id, sequences_by_md5, id_to_md5 = process_input_file(
+        args.input_file, 
+        file_format=args.format
     )
     
-    print(f"\n=== TSV Processing Complete ===")
+    # Save augmented TSV with MD5 column
+    augmented_tsv_path = os.path.join(args.output_dir, args.augmented_tsv_name)
+    save_augmented_tsv(sequences_by_id, id_to_md5, augmented_tsv_path)
+    
+    print(f"\n=== File Processing Complete ===")
     print(f"Total sequences: {len(sequences_by_id)}")
     print(f"Unique sequences (by MD5): {len(sequences_by_md5)}")
     print(f"Augmented TSV saved to: {augmented_tsv_path}")
@@ -408,6 +579,10 @@ def main():
     print("# Load embeddings by MD5")
     print(f"data_by_md5 = np.load('{args.embeddings_by_md5_name}')")
     print("embedding_for_md5 = data_by_md5['md5_hash_here']  # Get embedding for specific MD5")
+    print("")
+    print("# List all available IDs/MD5s")
+    print("all_ids = list(data_by_id.files)")
+    print("all_md5s = list(data_by_md5.files)")
     print("```")
 
 
